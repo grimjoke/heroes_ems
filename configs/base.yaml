@@ -1,0 +1,21 @@
+timing:
+  physics_hz: 2000
+  emg_hz: 2000
+  controller_hz: 100
+  stim_hz: 25                 # spec says 30, but 2000/30 is not an integer; 25 divides 2000
+  angle_sensor_hz: 100
+
+plant:
+  model_file: null            # null -> resolve from installed myosuite
+  model_relpath: simhive/myo_sim/elbow/myoelbow_1dof6muscles.xml
+  joints: [r_elbow_flex]
+  muscles: [BIClong, BICshort, BRA, TRIlong, TRIlat, TRImed]
+  forearm_body: r_ulna_radius_hand
+  gravity: true
+  exo_payload:
+    mass_kg: 0.0
+    pos_m: [0.0, -0.15, 0.0]  # in forearm body frame
+
+passive_drop:
+  duration_s: 3.0
+  q0_rad: 1.5
