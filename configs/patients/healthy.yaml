@@ -1,0 +1,9 @@
+name: healthy
+strength: {BIClong: 1.0, BICshort: 1.0, BRA: 1.0, TRIlong: 1.0, TRIlat: 1.0, TRImed: 1.0}
+onset_delay_ms: 150
+cocontraction: 0.02
+noise_std: 0.02
+drive:
+  approach_tau_s: 0.15
+  max_speed_rad_s: 2.0
+  gain: 1.0

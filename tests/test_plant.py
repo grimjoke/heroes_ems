@@ -69,3 +69,29 @@ def test_exo_payload_lowers_rest_angle_shift(cfg):
     for p in (base, loaded):
         run(p, np.zeros(6), 4.0)
     assert loaded.joint_state()[0][0] < base.joint_state()[0][0]
+
+
+def test_action_matrix_from_groups(cfg):
+    plant = Plant(cfg.plant, cfg.timing)
+    np.testing.assert_array_equal(plant.action[:, 0], [1, 1, 1, -1, -1, -1])
+
+
+def test_group_sign_checked_against_model(cfg):
+    groups = dict(cfg.plant.muscle_groups)
+    groups["elbow_flexors"] = groups["elbow_flexors"].model_copy(update={"sign": -1})
+    bad = cfg.plant.model_copy(update={"muscle_groups": groups})
+    with pytest.raises(ValueError, match="BIClong"):
+        Plant(bad, cfg.timing)
+
+
+def test_lock_is_isometric(cfg):
+    plant = Plant(cfg.plant, cfg.timing)
+    plant.reset(np.array([1.57]), np.zeros(1))
+    plant.lock(np.array([1.57]))
+    run(plant, np.array([1.0, 1.0, 1.0, 0, 0, 0]), 1.0)
+    q, qd = plant.joint_state()
+    assert q[0] == pytest.approx(1.57) and qd[0] == 0.0
+    assert plant.actuator_torque()[0] > 20.0  # flexors pull against the lock
+    plant.unlock()
+    run(plant, np.array([1.0, 1.0, 1.0, 0, 0, 0]), 0.3)
+    assert plant.joint_state()[0][0] > 1.7

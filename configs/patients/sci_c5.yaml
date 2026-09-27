@@ -1,0 +1,10 @@
+# C5 incomplete SCI: elbow flexors (C5-C6) partly preserved, triceps (C7) near-paralysed.
+name: sci_c5
+strength: {BIClong: 0.35, BICshort: 0.35, BRA: 0.4, TRIlong: 0.05, TRIlat: 0.05, TRImed: 0.05}
+onset_delay_ms: 300
+cocontraction: 0.05
+noise_std: 0.04
+drive:
+  approach_tau_s: 0.4
+  max_speed_rad_s: 1.0
+  gain: 0.5

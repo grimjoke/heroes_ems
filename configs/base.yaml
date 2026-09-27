@@ -10,6 +10,9 @@ plant:
   model_relpath: simhive/myo_sim/elbow/myoelbow_1dof6muscles.xml
   joints: [r_elbow_flex]
   muscles: [BIClong, BICshort, BRA, TRIlong, TRIlat, TRImed]
+  muscle_groups:              # sign: +1 flexion, -1 extension; checked against model moment arms
+    elbow_flexors: {joint: r_elbow_flex, sign: 1, muscles: [BIClong, BICshort, BRA]}
+    elbow_extensors: {joint: r_elbow_flex, sign: -1, muscles: [TRIlong, TRIlat, TRImed]}
   forearm_body: r_ulna_radius_hand
   gravity: true
   exo_payload:
@@ -19,3 +22,7 @@ plant:
 passive_drop:
   duration_s: 3.0
   q0_rad: 1.5
+
+metrics:
+  settle_s: 1.0
+  step_jump_rad: 0.05

@@ -45,7 +45,10 @@ class Plant:
         self._qpos_adr = self.model.jnt_qposadr[self._joint_ids]
         self._dof_adr = self.model.jnt_dofadr[self._joint_ids]
         self.joint_range = self.model.jnt_range[self._joint_ids].copy()
+        self.action = self._build_action_matrix()
+        self._lock: np.ndarray | None = None
         self._apply_exo_payload()
+        self._check_action_signs()
         self.reset(np.zeros(len(cfg.joints)), np.zeros(len(cfg.joints)))
 
     @property
@@ -75,6 +78,35 @@ class Plant:
             mujoco.mjtObj.mjOBJ_JOINT: self.model.njnt,
             mujoco.mjtObj.mjOBJ_ACTUATOR: self.model.nu,
         }[obj]
+
+    def _build_action_matrix(self) -> np.ndarray:
+        """A[M, N]: +1 muscle flexes joint, -1 extends, 0 no action (from config groups)."""
+        a = np.zeros((self.n_muscles, self.n_joints))
+        for g in self.cfg.muscle_groups.values():
+            j = self.cfg.joints.index(g.joint)
+            for m in g.muscles:
+                a[self.cfg.muscles.index(m), j] = g.sign
+        return a
+
+    def moment_arms(self) -> np.ndarray:
+        """dL/dq [M, N] at the current pose. Negative for a muscle that flexes the joint."""
+        m, d = self.model, self.data
+        dense = np.zeros((m.nu, m.nv))
+        mujoco.mju_sparse2dense(
+            dense, d.actuator_moment, d.moment_rownnz, d.moment_rowadr, d.moment_colind
+        )
+        return dense[np.ix_(self._act_ids, self._dof_adr)]
+
+    def _check_action_signs(self) -> None:
+        """Fail loudly if config muscle groups disagree with the model across the joint range."""
+        for frac in (0.1, 0.5, 0.9):
+            q = self.joint_range[:, 0] + frac * (self.joint_range[:, 1] - self.joint_range[:, 0])
+            self.reset(q, np.zeros(self.n_joints))
+            model_sign = -np.sign(self.moment_arms())
+            mismatch = (self.action != 0) & (model_sign != self.action)
+            if mismatch.any():
+                bad = [self.cfg.muscles[i] for i in np.nonzero(mismatch.any(axis=1))[0]]
+                raise ValueError(f"muscle_groups sign disagrees with model moment arms: {bad}")
 
     def _apply_exo_payload(self) -> None:
         """Add a passive point mass to the forearm body (composite mass, COM and inertia)."""
@@ -108,7 +140,21 @@ class Plant:
         m.body_subtreemass[b] = mt  # leaf body; mj_setConst refreshes the rest
         mujoco.mj_setConst(m, mujoco.MjData(m))
 
+    def lock(self, q: np.ndarray) -> None:
+        """Hold joints kinematically at q (isometric trials). Muscles still produce force."""
+        self._lock = np.asarray(q, dtype=np.float64).copy()
+        self._pin()
+        mujoco.mj_forward(self.model, self.data)
+
+    def unlock(self) -> None:
+        self._lock = None
+
+    def _pin(self) -> None:
+        self.data.qpos[self._qpos_adr] = self._lock
+        self.data.qvel[self._dof_adr] = 0.0
+
     def reset(self, qpos: np.ndarray, qvel: np.ndarray) -> None:
+        self._lock = None
         mujoco.mj_resetData(self.model, self.data)
         self.data.qpos[self._qpos_adr] = qpos
         self.data.qvel[self._dof_adr] = qvel
@@ -124,13 +170,21 @@ class Plant:
         if excitation.shape != (self.n_muscles,):
             raise ValueError(f"excitation shape {excitation.shape}, expected ({self.n_muscles},)")
         self.data.ctrl[self._act_ids] = np.clip(excitation, 0.0, 1.0)
+        if self._lock is not None:
+            self._pin()
         mujoco.mj_step(self.model, self.data)
+        if self._lock is not None:
+            self._pin()
 
     def joint_state(self) -> tuple[np.ndarray, np.ndarray]:
         return (
             self.data.qpos[self._qpos_adr].copy(),
             self.data.qvel[self._dof_adr].copy(),
         )
+
+    def actuator_torque(self) -> np.ndarray:
+        """Net muscle torque per joint (N m, + flexion) from the last step."""
+        return self.data.qfrc_actuator[self._dof_adr].copy()
 
     def muscle_state(self) -> MuscleState:
         ids = self._act_ids

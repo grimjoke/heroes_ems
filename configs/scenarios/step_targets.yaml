@@ -1,0 +1,12 @@
+kind: movement
+name: step_targets
+patient_file: ../patients/healthy.yaml
+duration_s: 16.0
+initial_state: {q: [0.54], qd: [0.0]}   # hanging posture
+target:
+  - {kind: hold, duration_s: 1.0}
+  - {kind: step, duration_s: 3.0, q: [1.2]}
+  - {kind: step, duration_s: 3.0, q: [1.8]}
+  - {kind: step, duration_s: 3.0, q: [0.9]}
+  - {kind: ramp, duration_s: 2.0, q: [1.5]}
+  - {kind: sine, duration_s: 4.0, center: [1.2], amplitude: [0.3], freq_hz: 0.5}

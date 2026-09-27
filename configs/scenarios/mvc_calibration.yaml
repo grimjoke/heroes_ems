@@ -1,0 +1,9 @@
+kind: mvc
+name: mvc_calibration
+patient_file: ../patients/healthy.yaml
+lock_q: [1.5708]                         # isometric at 90 deg
+rest_s: 2.0
+window_s: 1.0
+trials:
+  - {group: elbow_flexors, effort_s: 3.0}
+  - {group: elbow_extensors, effort_s: 3.0}
