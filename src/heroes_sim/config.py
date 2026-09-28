@@ -147,10 +147,51 @@ class WhiteNoiseConfig(_Strict):
     std_mv: float = Field(ge=0)
 
 
+class StimArtifactConfig(_Strict):
+    """Spike on every pulse: amplitude_mv[emg][stim] * intensity, exponential decay."""
+
+    enabled: bool
+    amplitude_mv: dict[str, dict[str, float]]  # EMG channel -> stim channel -> mV at intensity 1
+    decay_ms: float = Field(gt=0)
+
+
+class MWaveConfig(_Strict):
+    """Evoked compound response per pulse: one sine cycle after `latency_ms`, peak
+    amplitude_mv[muscle] * recruitment, seen through the sensor matrix S."""
+
+    enabled: bool
+    amplitude_mv: dict[str, float]  # per muscle, peak at full recruitment
+    latency_ms: float = Field(ge=0)
+    duration_ms: float = Field(gt=0)
+
+
+class PowerlineConfig(_Strict):
+    enabled: bool
+    freq_hz: float = Field(gt=0)  # 50 Hz mains (Greece)
+    amplitude_mv: list[float] = Field(min_length=1)  # fundamental, then harmonics
+
+
+class BaselineWanderConfig(_Strict):
+    enabled: bool
+    std_mv: float = Field(ge=0)
+    cutoff_hz: float = Field(gt=0)
+
+
+class MotionArtifactConfig(_Strict):
+    enabled: bool
+    gain_mv_per_rad_s: dict[str, dict[str, float]]  # EMG channel -> joint -> mV per rad/s
+
+
 class EMGConfig(_Strict):
     channels: list[EMGChannelConfig] = Field(min_length=1)
     volitional: VolitionalEMGConfig
     white_noise: WhiteNoiseConfig
+    stim_artifact: StimArtifactConfig
+    m_wave: MWaveConfig
+    powerline: PowerlineConfig
+    baseline_wander: BaselineWanderConfig
+    motion: MotionArtifactConfig
+    saturation_mv: float | None = Field(gt=0)  # amplifier clipping; None -> no clipping
 
 
 class AngleSensorConfig(_Strict):
@@ -198,6 +239,8 @@ class ControllerSection(_Strict):
     bandpass_order: int = Field(ge=1)
     envelope_hz: float = Field(gt=0)
     envelope_order: int = Field(ge=1)
+    blanking_ms: float = Field(ge=0)  # 0 -> no blanking stage
+    blanking_fill: Literal["hold", "zero"]
     deadband: float = Field(ge=0, lt=1)
     derivative_tau_s: float = Field(ge=0)
     latency_ticks: int = Field(ge=0)  # compute latency before output takes effect
@@ -231,6 +274,10 @@ class CalibrationConfig(_Strict):
 
     @model_validator(mode="after")
     def _window_fits(self) -> CalibrationConfig:
+        # The rest baseline is the last window_s of each rest; the first half of the rest
+        # is left for the previous effort's EMG and envelope to die away.
+        if self.rest_s < 2 * self.window_s:
+            raise ValueError(f"rest_s {self.rest_s} must be >= 2 * window_s {self.window_s}")
         for tr in self.trials:
             if self.window_s > tr.effort_s:
                 raise ValueError(f"window_s {self.window_s} > effort_s {tr.effort_s}")
@@ -321,9 +368,17 @@ class SimConfig(_Strict):
                 need(c.weights, muscles, f"emg channel '{c.name}' weights")
                 need([c.mvc_group], self.plant.muscle_groups, f"emg channel '{c.name}' mvc_group")
             need(self.emg.volitional.amplitude_mv, muscles, "emg.volitional.amplitude_mv")
+            need(self.emg.m_wave.amplitude_mv, muscles, "emg.m_wave.amplitude_mv")
+            need(self.emg.stim_artifact.amplitude_mv, emg_names, "emg.stim_artifact channels")
+            need(self.emg.motion.gain_mv_per_rad_s, emg_names, "emg.motion channels")
+            for c, per_joint in self.emg.motion.gain_mv_per_rad_s.items():
+                need(per_joint, joints, f"emg.motion.{c}")
         stim_names: list[str] = []
         if self.stim is not None:
             stim_names = [c.name for c in self.stim.channels]
+            if self.emg is not None:
+                for c, per_stim in self.emg.stim_artifact.amplitude_mv.items():
+                    need(per_stim, stim_names, f"emg.stim_artifact.{c}")
             for c in self.stim.channels:
                 need([c.joint], joints, f"stim channel '{c.name}' joint")
                 need(c.muscles, muscles, f"stim channel '{c.name}' muscles")

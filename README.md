@@ -34,17 +34,41 @@ Each run writes `runs/<scenario>_<patient>_s<seed>/` containing:
 - `events.parquet`: safety rule firings
 - `meta.json`: the resolved config, seed, git hash, package versions, MVC values and metrics
 
-Seed 0 with the default configs gives:
+Seed 0 with the default configs (full EMG noise model, sample-and-hold blanking) gives:
 
 | | healthy | sci_c5 |
 |---|---|---|
-| step_targets tracking RMSE, closed loop (open loop) | 0.095 (0.097) rad | 0.201 (0.196) rad |
-| step_targets reference-vs-target RMSE | 0.23 rad | 0.23 rad |
+| step_targets tracking RMSE, closed loop (open loop) | 0.094 (0.097) rad | 0.206 (0.196) rad |
+| step_targets reference-vs-target RMSE | 0.21 rad | 0.28 rad |
 | no_intent: arm excursion / reference drift | 0.03 / 0.00 rad | 0.15 / 0.00 rad |
-| no_intent stim dose, biceps / triceps (intensity x s over 10 s) | 0.00 / 0.13 | 0.00 / 0.66 |
-| MVC envelope (rest), biceps / triceps | 0.573 (0.013) / 0.460 (0.011) mV | 0.200 (0.011) / 0.023 (0.003) mV |
+| MVC envelope (rest), biceps / triceps | 0.583 (0.018) / 0.464 (0.017) mV | 0.205 (0.016) / 0.026 (0.014) mV |
 
 A 16 s closed-loop episode plus its 12 s calibration runs at ~6x real time.
+
+### M3: stim artifact feedback and blanking
+
+```bash
+uv run python scripts/artifact_demo.py [--patient configs/patients/healthy.yaml]
+```
+
+The EMG now carries everything stimulation puts on it:
+- a stim artifact on every delivered pulse, scaled by intensity and electrode proximity, with a 2 ms decay;
+- M-waves: one sine cycle 4 ms after each pulse, scaled by the recruitment of each muscle;
+- 50 Hz mains plus harmonics, baseline wander, and an optional motion artifact coupled to joint velocity;
+- amplifier saturation at ±10 mV.
+
+Every component can be switched off under `emg.*`. The loop that results is stim → artifact/M-wave → envelope up → intent → more stim.
+
+| sci_c5, seed 0 | clean EMG (M2) | no blanking | zero-fill blanking | **hold blanking** (default) |
+|---|---|---|---|---|
+| no_intent reference drift | 0.00 rad | **0.44 rad** (runs into the ROM clamp) | **0.44 rad** | 0.00 rad |
+| step_targets tracking RMSE | 0.20 rad | **0.79 rad** | **0.72 rad** | 0.21 rad |
+| step_targets triceps dose (intensity x s) | 0.29 | **4.65** | **4.18** | 0.47 |
+
+- **Without blanking the loop runs away into extension.** Triceps stim → triceps artifact → extension intent → more triceps stim. The healthy patient shows the same runaway: the reference hits the extension clamp and the triceps dose reaches 8.5. Yet their tracking RMSE rises only from 0.095 to 0.114, because they overpower the stim with their own muscles. **Tracking error alone would hide this; watch the reference and the dose.**
+- **Zero-fill blanking is not enough.** Zeroing a 20 ms window cuts a rectangular notch out of the slow baseline wander. The bandpass turns each notch into a transient that reads as EMG. That is enough to drive the near-paralysed triceps channel, whose MVC envelope is 0.026 mV.
+- **Sample-and-hold blanking works.** It is `controller.blanking_fill: hold`, which holds the last pre-pulse sample through a 20 ms window. The window covers the artifact (10 x 2 ms) and the M-wave (4 + 10 ms). It is the default, and it restores M2 performance.
+- **Cost:** volitional EMG inside the window is lost. Under stim the envelope reads low by about window / period (20 / 40 ms), so intent is underestimated while stimulating.
 
 ### What M2 shows
 - **Resting noise floor on a weak channel.** The near-paralysed triceps of `sci_c5` has an MVC envelope of 0.023 mV. Without rest-baseline subtraction, its resting floor (sensor noise, crosstalk, tone) normalizes to 0.15-0.2 of MVC. The controller then reads that as a steady extension intent and stimulates against every flexion. Baseline subtraction (below) fixes it.
@@ -64,9 +88,9 @@ uv run ruff check . && uv run ruff format .
 |---|---|---|
 | M0: scaffold, config schemas, plant, passive drop | Done | |
 | M1: patient model, open-loop movement, MVC trial | Done | |
-| M2: clean EMG, controller, safety, stim; closed loop | Done | 95 tests passing |
-| M3: stim artifact, M-waves, blanking stage | Next | `PulseEvent`s and the front-end stage list are ready for it |
-| M4: fatigue, faults, perturbations, sweeps + SLURM | Not started | |
+| M2: clean EMG, controller, safety, stim; closed loop | Done | |
+| M3: stim artifact, M-waves, blanking stage | Done | 113 tests passing |
+| M4: fatigue, faults, perturbations, sweeps + SLURM | Next | stim `capacity` is the fatigue hook |
 | M5: first sweep (noise x gain) | Not started | |
 
 ### Deviations from spec
@@ -83,5 +107,8 @@ uv run ruff check . && uv run ruff format .
 - **The safety rate limit applies to rises only.** Decreases are immediate, so a cut is never slowed down.
 - Controller and safety configs are plain frozen dataclasses that validate themselves, with no pydantic in the pure packages. The sim resolves YAML names into their indices (`runner.build_*_config`). Stim channel geometry (`stim.channels[].joint/sign`) is the single source for both controller allocation and the safety ROM guard.
 - `ControllerPipeline.step` takes `q_meas` as a float or an array[N] (for N joints).
-- Not in M2: fatigue (the stim model's `capacity` is fixed at 1 until M4), metrics for time to reach target and overshoot, and the optional full-rate (2 kHz) log.
+- Not yet included: fatigue (the stim model's `capacity` is fixed at 1 until M4), metrics for time to reach target and overshoot, and the optional full-rate (2 kHz) log.
+- The blanking stage gets the stimulator's sync signal (`ControllerPipeline.on_stim_pulse`), as on hardware. Only pulses with nonzero intensity count as delivered: they alone produce artifacts and trigger blanking, so blanking costs nothing while stim is off.
+- The blanking fill is sample-and-hold by default, not zero (see M3). `zero` is kept for comparison.
+- The calibration requires `rest_s >= 2 * window_s`. The rest baseline is the last `window_s` of each rest, so the previous effort's envelope has time to decay first.
 - Muscle-to-joint action comes from `plant.muscle_groups` in config. The plant checks each group's sign against the model's moment arms and fails loudly on a mismatch.

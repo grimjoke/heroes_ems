@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from heroes_control.allocation import SignedAllocation
+from heroes_control.blanking import FILL_MODES, StimBlanking
 from heroes_control.filters import EMGFrontEnd, Rectify, bandpass, lowpass
 from heroes_control.intent import AgonistAntagonistIntent
 from heroes_control.normalization import MVCNormalizer, MVCValues
@@ -30,6 +31,8 @@ class ControllerConfig:
     bandpass_order: int
     envelope_hz: float
     envelope_order: int
+    blanking_s: float  # stim-artifact blanking window after each pulse; 0 = no blanking stage
+    blanking_fill: str  # "hold" (sample-and-hold) or "zero"
     agonist: tuple[int, ...]  # EMG channel per joint
     antagonist: tuple[int, ...]
     deadband: float
@@ -62,6 +65,10 @@ class ControllerConfig:
             raise ValueError(f"bandpass {self.bandpass_hz} must satisfy 0 < lo < hi < fs/2")
         if not 0 < self.envelope_hz < self.emg_fs_hz / 2:
             raise ValueError("envelope_hz must be in (0, fs/2)")
+        if self.blanking_s < 0:
+            raise ValueError("blanking_s must be >= 0")
+        if self.blanking_fill not in FILL_MODES:
+            raise ValueError(f"blanking_fill must be one of {FILL_MODES}")
         if not 0 <= self.deadband < 1:
             raise ValueError("deadband must be in [0, 1)")
         if any(a >= b for a, b in zip(self.q_min, self.q_max, strict=True)):
@@ -80,14 +87,16 @@ class ControllerConfig:
 
 
 def default_front_end(cfg: ControllerConfig) -> EMGFrontEnd:
+    """[blanking (if blanking_s > 0)] -> bandpass -> rectify -> lowpass envelope."""
     lo, hi = cfg.bandpass_hz
-    return EMGFrontEnd(
-        [
-            bandpass(lo, hi, cfg.bandpass_order, cfg.emg_fs_hz, cfg.n_emg),
-            Rectify(),
-            lowpass(cfg.envelope_hz, cfg.envelope_order, cfg.emg_fs_hz, cfg.n_emg),
-        ]
-    )
+    stages = [
+        bandpass(lo, hi, cfg.bandpass_order, cfg.emg_fs_hz, cfg.n_emg),
+        Rectify(),
+        lowpass(cfg.envelope_hz, cfg.envelope_order, cfg.emg_fs_hz, cfg.n_emg),
+    ]
+    if cfg.blanking_s > 0:
+        stages.insert(0, StimBlanking(cfg.emg_fs_hz, cfg.blanking_s, cfg.n_emg, cfg.blanking_fill))
+    return EMGFrontEnd(stages)
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,12 @@ class ControllerPipeline:
             stage.reset()
         self.reference.reset(np.atleast_1d(np.asarray(q0, dtype=np.float64)))
         self._envelope = np.zeros(self.cfg.n_emg)
+
+    def on_stim_pulse(self, t: float) -> None:
+        """Stimulator sync: forwarded to every front-end stage that listens (`on_pulse`)."""
+        for stage in self.front_end.stages:
+            if hasattr(stage, "on_pulse"):
+                stage.on_pulse(t)
 
     def step(self, t: float, emg_chunk: np.ndarray, q_meas: float | np.ndarray) -> ControllerOutput:
         """One controller tick. `emg_chunk[n, J]` is all raw EMG since the previous tick."""

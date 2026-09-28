@@ -19,6 +19,8 @@ def config(**kw):
         "bandpass_order": 4,
         "envelope_hz": 4.0,
         "envelope_order": 2,
+        "blanking_s": 0.0,
+        "blanking_fill": "hold",
         "agonist": (0,),
         "antagonist": (1,),
         "deadband": 0.05,

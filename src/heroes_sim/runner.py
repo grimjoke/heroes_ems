@@ -51,6 +51,8 @@ def build_controller_config(cfg: SimConfig) -> ControllerConfig:
         bandpass_order=c.bandpass_order,
         envelope_hz=c.envelope_hz,
         envelope_order=c.envelope_order,
+        blanking_s=c.blanking_ms * 1e-3,
+        blanking_fill=c.blanking_fill,
         agonist=tuple(emg.index(j.agonist) for j in joints),
         antagonist=tuple(emg.index(j.antagonist) for j in joints),
         deadband=c.deadband,
@@ -236,9 +238,10 @@ class _Episode:
         self.emg = EMGSensor(
             cfg.emg,
             cfg.plant.muscles,
+            cfg.plant.joints,
+            [ch.name for ch in cfg.stim.channels],
             float(t.emg_hz),
-            make_rng(seed, prefix + "emg/volitional"),
-            make_rng(seed, prefix + "emg/noise"),
+            lambda name: make_rng(seed, f"{prefix}emg/{name}"),
         )
         self.angle = AngleSensor(
             cfg.angle_sensor,
@@ -264,6 +267,14 @@ class _Episode:
             self.front_end = default_front_end(self.ctrl_cfg)
         self.events: list[SafetyEvent] = []
 
+    def _pulse(self, now: float, applied: np.ndarray, offset: int) -> None:
+        """Stimulator fires: latch recruitment; EMG sees the artifact and M-wave starting
+        `offset` samples into its next chunk; the controller gets the sync signal."""
+        ev = self.stim.pulse(now, applied)
+        if ev.active:
+            self.emg.add_pulse(offset, ev)
+            self.controller.on_stim_pulse(now)
+
     def run(
         self, duration_s: float, intent_at: Callable[[float], Intent], on_step: StepHook | None
     ) -> pd.DataFrame:
@@ -279,6 +290,7 @@ class _Episode:
         n_stim = len(stim_names)
         applied = np.zeros(n_stim)
         u_buf = np.zeros((per_tick, len(muscles)))
+        qd_buf = np.zeros((per_tick, len(joints)))
         u_stim = np.zeros(len(muscles))
         groups = np.empty(log.n, dtype=object)
         k = i = 0
@@ -298,15 +310,16 @@ class _Episode:
             ticks = sched.advance()
             now = sched.t
             q, qd = plant.joint_state()
+            qd_buf[i - 1] = qd
             self.angle.push(q)
             if ticks.angle_sensor:
                 self.q_meas = self.angle.sample()
             if not ticks.controller:
                 if ticks.stim and self.closed_loop:
-                    self.stim.pulse(now, applied)
+                    self._pulse(now, applied, offset=i)
                 continue
 
-            emg_chunk = self.emg.chunk(u_buf[:i])
+            emg_chunk = self.emg.chunk(u_buf[:i], qd_buf[:i])
             i = 0
             if self.closed_loop:
                 out = self.controller.step(now, emg_chunk, self.q_meas)
@@ -327,7 +340,7 @@ class _Episode:
             else:
                 env = self.front_end.process(now, emg_chunk)[-1]
             if ticks.stim and self.closed_loop:
-                self.stim.pulse(now, applied)
+                self._pulse(now, applied, offset=0)
 
             target = np.full(len(joints), np.nan) if intent.target is None else intent.target
             log.put(k, "t", ["s"], [now])

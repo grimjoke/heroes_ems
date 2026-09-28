@@ -11,14 +11,14 @@ from heroes_sim.runner import run
 
 J = "r_elbow_flex"
 SCI = "configs/patients/sci_c5.yaml"
-# Calibrated values (seed 0) so closed-loop tests skip the 12 s calibration.
+# Calibrated values (seed 0, full noise model) so closed-loop tests skip calibration.
 HEALTHY_MVC = {
-    "scenario.mvc": {"biceps": 0.5827, "triceps": 0.4644},
-    "scenario.mvc_rest": {"biceps": 0.0138, "triceps": 0.0113},
+    "scenario.mvc": {"biceps": 0.5833, "triceps": 0.4640},
+    "scenario.mvc_rest": {"biceps": 0.0180, "triceps": 0.0171},
 }
 SCI_MVC = {
-    "scenario.mvc": {"biceps": 0.2036, "triceps": 0.0232},
-    "scenario.mvc_rest": {"biceps": 0.0115, "triceps": 0.0030},
+    "scenario.mvc": {"biceps": 0.2052, "triceps": 0.0260},
+    "scenario.mvc_rest": {"biceps": 0.0164, "triceps": 0.0136},
 }
 
 
@@ -43,14 +43,16 @@ def test_healthy_reaches_step_targets_open_loop():
 def test_mvc_calibration_values_and_impairment():
     out = {}
     for patient in (None, SCI):
-        res = run(cfg_for("mvc_calibration", patient, **{"calibration.rest_s": 1.0}), seed=0)
+        res = run(cfg_for("mvc_calibration", patient), seed=0)
         cal = res.calibration
         out[patient] = ({r.group: r for r in cal.trials}, cal.mvc)
         assert res.log[f"q_{J}"].eq(res.log[f"q_{J}"].iloc[0]).all()  # isometric
-        # Rest floor is a noticeable fraction of a near-paralysed channel's MVC (~13% for the
-        # sci_c5 triceps), which is why normalization subtracts it.
-        assert all(0 < r < 0.25 * m for r, m in zip(cal.mvc.rest, cal.mvc.envelope))
+        # Rest floor (sensor noise, mains, crosstalk, tone) is below MVC on every channel;
+        # for the near-paralysed sci_c5 triceps it is about half of it, which is why
+        # normalization subtracts it.
+        assert all(0 < r < m for r, m in zip(cal.mvc.rest, cal.mvc.envelope))
     (h_trials, h_mvc), (s_trials, s_mvc) = out[None], out[SCI]
+    assert all(r < 0.1 * m for r, m in zip(h_mvc.rest, h_mvc.envelope))
     assert h_trials["elbow_flexors"].torque[0] > 30 and h_trials["elbow_extensors"].torque[0] < -20
     assert 0 < s_trials["elbow_flexors"].torque[0] < h_trials["elbow_flexors"].torque[0]
     # Near-paralysed triceps: much smaller MVC envelope than healthy.
@@ -58,7 +60,8 @@ def test_mvc_calibration_values_and_impairment():
 
 
 def test_calibration_runs_before_closed_loop_episode():
-    cfg = cfg_for("no_intent", **{"scenario.duration_s": 1.0, "calibration.rest_s": 0.5})
+    short = {"calibration.rest_s": 0.5, "calibration.window_s": 0.25}
+    cfg = cfg_for("no_intent", **{"scenario.duration_s": 1.0, **short})
     res = run(cfg, seed=0)
     assert res.calibration is not None and res.mvc == res.calibration.mvc
 
@@ -103,3 +106,27 @@ def test_same_seed_identical_parquet(tmp_path):
     assert blobs[0] == blobs[1]
     a, c = (pd.read_parquet(p / "log.parquet") for p in (paths[0], paths[2]))
     assert not np.array_equal(a["u_vol_BIClong"], c["u_vol_BIClong"])
+
+
+@pytest.mark.parametrize(
+    "blanking,runaway",
+    [
+        ({"controller.blanking_ms": 0}, True),
+        ({"controller.blanking_fill": "zero"}, True),
+        ({}, False),
+    ],
+    ids=["no_blanking", "zero_fill", "hold_fill"],
+)
+def test_stim_artifact_feedback_and_blanking(blanking, runaway):
+    """M3 failure mode: stim -> artifact/M-wave -> envelope -> intent -> more stim.
+
+    sci_c5 with no intent: without blanking (or with zero-fill blanking, whose notches in
+    the baseline read as EMG) the reference runs away into the ROM clamp. Sample-and-hold
+    blanking keeps it still.
+    """
+    log = run(cfg_for("no_intent", SCI, **SCI_MVC, **blanking), seed=0).log
+    drift = metrics.max_excursion(log, J, of="ref")
+    if runaway:
+        assert drift > 0.3
+    else:
+        assert drift < 0.05
