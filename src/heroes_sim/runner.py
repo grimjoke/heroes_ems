@@ -20,8 +20,10 @@ from heroes_control import (
     ControllerConfig,
     ControllerPipeline,
     MVCValues,
+    calibrate_deadband,
     default_front_end,
 )
+from heroes_control.normalization import MVCNormalizer
 from heroes_safety import RULES, SafetyConfig, SafetyEvent, SafetySupervisor
 from heroes_sim.config import MovementScenario, MVCScenario, SimConfig
 from heroes_sim.patient import NO_INTENT, Intent, Patient
@@ -53,9 +55,11 @@ def build_controller_config(cfg: SimConfig) -> ControllerConfig:
         envelope_order=c.envelope_order,
         blanking_s=c.blanking_ms * 1e-3,
         blanking_fill=c.blanking_fill,
+        blanking_correction=c.blanking_correction,
         agonist=tuple(emg.index(j.agonist) for j in joints),
         antagonist=tuple(emg.index(j.antagonist) for j in joints),
-        deadband=c.deadband,
+        deadband_floor=c.deadband_floor,
+        deadband_k=c.deadband_k,
         gain=tuple(j.gain for j in joints),
         damping=tuple(j.damping for j in joints),
         q_min=tuple(j.rom[0] for j in joints),
@@ -65,6 +69,8 @@ def build_controller_config(cfg: SimConfig) -> ControllerConfig:
         derivative_tau_s=c.derivative_tau_s,
         channel_joint=tuple(cfg.plant.joints.index(ch.joint) for ch in cfg.stim.channels),
         channel_sign=tuple(ch.sign for ch in cfg.stim.channels),
+        allocation_offset=c.allocation.offset,
+        allocation_epsilon=c.allocation.epsilon,
     )
 
 
@@ -101,7 +107,7 @@ class MVCTrialResult:
 class Calibration:
     log: pd.DataFrame
     trials: list[MVCTrialResult]
-    mvc: MVCValues  # per EMG channel: best-window envelope in its group's trial + rest
+    mvc: MVCValues  # MVC + rest per EMG channel, deadband per joint
 
 
 @dataclass(frozen=True)
@@ -110,6 +116,7 @@ class RunResult:
     mvc: MVCValues | None = None
     calibration: Calibration | None = None  # when calibration ran in this run
     events: list[SafetyEvent] = field(default_factory=list)
+    baseline_log: pd.DataFrame | None = None  # stim-off run, same seed (stim_off_baseline)
 
 
 StepHook = Callable[[Plant], None]
@@ -137,18 +144,25 @@ def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult
 
     cal, mvc = None, None
     if sc.closed_loop:
-        if sc.mvc is not None:
+        if sc.calibrated is not None:
+            p = sc.calibrated
             names = [ch.name for ch in cfg.emg.channels]
             mvc = MVCValues(
-                tuple(sc.mvc[n] for n in names),
-                None if sc.mvc_rest is None else tuple(sc.mvc_rest[n] for n in names),
+                tuple(p.envelope[n] for n in names),
+                tuple(p.rest[n] for n in names),
+                tuple(p.deadband[j] for j in cfg.plant.joints),
             )
         else:
             cal = calibrate(cfg, seed, "calibration/", None)
             mvc = cal.mvc
     ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=mvc)
     log = ep.run(sc.duration_s, intent_at, on_step)
-    return RunResult(log=log, mvc=mvc, calibration=cal, events=ep.events)
+    baseline = None
+    if sc.stim_off_baseline and sc.closed_loop:
+        # Same seed and component names -> same patient/sensor noise; only stim differs.
+        base_ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=None)
+        baseline = base_ep.run(sc.duration_s, intent_at, None)
+    return RunResult(log=log, mvc=mvc, calibration=cal, events=ep.events, baseline_log=baseline)
 
 
 def calibrate(cfg: SimConfig, seed: int, prefix: str, on_step: StepHook | None) -> Calibration:
@@ -175,7 +189,19 @@ def calibrate(cfg: SimConfig, seed: int, prefix: str, on_step: StepHook | None) 
         env = log[f"env_{ch.name}"].to_numpy()
         mvc.append(float(_best_mean(env[log["mvc_group"] == ch.mvc_group], w)[0]))
         rest.append(float(env[at_rest].mean()))
-    return Calibration(log=log, trials=trials, mvc=MVCValues(tuple(mvc), tuple(rest)))
+    # Deadband from resting intent noise, through the controller's own normalization.
+    ctrl = build_controller_config(cfg)
+    norm = MVCNormalizer(MVCValues(tuple(mvc), tuple(rest)))
+    env_rest = log.loc[at_rest, [f"env_{ch.name}" for ch in cfg.emg.channels]].to_numpy()
+    deadband = calibrate_deadband(
+        np.array([norm(e) for e in env_rest]),
+        ctrl.agonist,
+        ctrl.antagonist,
+        ctrl.deadband_k,
+        ctrl.deadband_floor,
+    )
+    values = MVCValues(tuple(mvc), tuple(rest), deadband)
+    return Calibration(log=log, trials=trials, mvc=values)
 
 
 def _best_mean(x: np.ndarray, w: int) -> tuple[float, int]:

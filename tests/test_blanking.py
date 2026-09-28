@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from heroes_control import ControllerPipeline, MVCValues
-from heroes_control.blanking import StimBlanking
+from heroes_control import ControllerPipeline, MVCValues, default_front_end
+from heroes_control.blanking import BlankingCorrection, StimBlanking
 
 FS = 2000.0
 
@@ -69,3 +69,52 @@ def test_pipeline_forwards_stim_sync():
     ctrl.on_stim_pulse(0.0)
     out = ctrl.step(0.01, np.full((20, 2), 5.0), 0.5)  # samples 1..20 after the pulse
     np.testing.assert_array_equal(out.envelope, 0.0)
+
+
+def _envelope(fill, correction, blank=True, seconds=6.0):
+    """Mean envelope of steady unit-RMS EMG with a 25 Hz pulse train, after 1 s settling.
+
+    Built by hand: the config (rightly) refuses zero fill without correction."""
+    from heroes_control import EMGFrontEnd
+    from tests.test_controller import config
+
+    stages = default_front_end(config()).stages  # bandpass, rectify, envelope
+    if blank:
+        b = StimBlanking(FS, 0.015, 2, fill)
+        stages = [b, *stages]
+        if correction:
+            stages.append(BlankingCorrection(b, stages[-1].sos))
+    fe = EMGFrontEnd(stages)
+    x = np.random.default_rng(1).standard_normal((int(seconds * FS), 2))
+    out, pulse_every = [], int(FS / 25)
+    for i in range(0, len(x), 20):
+        t = (i + 19) / FS
+        if blank:
+            for p in range(i, i + 20):
+                if p % pulse_every == 0:
+                    for st in fe.stages:
+                        if hasattr(st, "on_pulse"):
+                            st.on_pulse(p / FS)
+        out.append(fe.process(t, x[i : i + 20]))
+    return np.concatenate(out)[int(FS) :].mean(axis=0)
+
+
+def test_zero_fill_bias_and_correction():
+    """D3: zero fill reads low (~0.70 of the unblanked envelope with a 15 ms window at
+    25 Hz); the kept-fraction correction brings it back but overshoots (~1.11), because
+    the bandpass smears the gaps, so less is lost than the 37.5% blanked. Hold reads
+    ~0.94 with no correction. Characterized here; see README."""
+    ref = _envelope("hold", False, blank=False)
+    zeroed = _envelope("zero", False) / ref
+    corrected = _envelope("zero", True) / ref
+    held = _envelope("hold", False) / ref
+    assert np.all(zeroed < 0.8)
+    assert np.all((corrected > 1.0) & (corrected < 1.2))
+    assert np.all(np.abs(corrected - 1) < np.abs(zeroed - 1))
+    assert np.all((held > 0.9) & (held < 1.0))
+
+
+def test_correction_starts_at_steady_state():
+    unity_dc = np.array([[0.5, 0, 0, 1, -0.5, 0]])  # y = 0.5 x + 0.5 y[-1], DC gain 1
+    corr = BlankingCorrection(StimBlanking(FS, 0.015, 2), unity_dc)
+    np.testing.assert_allclose(corr.process(0.0, np.ones((5, 2))), 1.0)

@@ -118,6 +118,14 @@ class InitialState(_Strict):
     qd: list[float]
 
 
+class CalibratedValues(_Strict):
+    """Pinned calibration results, to skip the MVC trial (e.g. from a previous run's meta)."""
+
+    envelope: dict[str, float]  # EMG channel -> MVC envelope
+    rest: dict[str, float]  # EMG channel -> resting envelope
+    deadband: dict[str, float]  # joint -> intent deadband
+
+
 class MovementScenario(_Strict):
     kind: Literal["movement"]
     name: str
@@ -125,8 +133,8 @@ class MovementScenario(_Strict):
     target: list[Segment] | None  # None -> patient intends nothing (no_intent)
     duration_s: float = Field(gt=0)
     closed_loop: bool  # false: volitional only, no controller or stim
-    mvc: dict[str, float] | None = None  # EMG channel -> MVC envelope; None -> calibrate first
-    mvc_rest: dict[str, float] | None = None  # EMG channel -> resting envelope (with `mvc`)
+    calibrated: CalibratedValues | None = None  # None -> run the calibration trial first
+    stim_off_baseline: bool = False  # also run stim-off (open loop) for baseline metrics
 
 
 class EMGChannelConfig(_Strict):
@@ -234,6 +242,17 @@ class JointControlConfig(_Strict):
     kd: float = Field(ge=0)
 
 
+class AllocationConfig(_Strict):
+    offset: float = Field(ge=0, lt=1)  # 0 = plain split; > 0 = recruitment-threshold offset
+    epsilon: float = Field(ge=0)  # the offset applies only above this PD output
+
+    @model_validator(mode="after")
+    def _gated(self) -> AllocationConfig:
+        if self.offset > 0 and self.epsilon <= 0:
+            raise ValueError("allocation.offset > 0 needs allocation.epsilon > 0")
+        return self
+
+
 class ControllerSection(_Strict):
     bandpass_hz: tuple[float, float]
     bandpass_order: int = Field(ge=1)
@@ -241,7 +260,10 @@ class ControllerSection(_Strict):
     envelope_order: int = Field(ge=1)
     blanking_ms: float = Field(ge=0)  # 0 -> no blanking stage
     blanking_fill: Literal["hold", "zero"]
-    deadband: float = Field(ge=0, lt=1)
+    blanking_correction: bool  # must be true with zero fill, false with hold
+    deadband_floor: float = Field(ge=0, lt=1)  # lower bound for the calibrated deadband
+    deadband_k: float = Field(ge=0)  # deadband = max(floor, k * sigma of resting intent)
+    allocation: AllocationConfig
     derivative_tau_s: float = Field(ge=0)
     latency_ticks: int = Field(ge=0)  # compute latency before output takes effect
     joints: dict[str, JointControlConfig]
@@ -393,13 +415,14 @@ class SimConfig(_Strict):
             if set(self.safety.joint_limits) != joints or set(self.safety.q_plausible) != joints:
                 raise ValueError("safety.joint_limits and safety.q_plausible must list every joint")
         sc = self.scenario
-        if isinstance(sc, MovementScenario):
-            for key in ("mvc", "mvc_rest"):
-                given = getattr(sc, key)
-                if given is not None and set(given) != set(emg_names):
-                    raise ValueError(f"scenario.{key} must give a value for every EMG channel")
-            if sc.mvc_rest is not None and sc.mvc is None:
-                raise ValueError("scenario.mvc_rest requires scenario.mvc")
+        if isinstance(sc, MovementScenario) and sc.calibrated is not None:
+            cal = sc.calibrated
+            if set(cal.envelope) != set(emg_names) or set(cal.rest) != set(emg_names):
+                raise ValueError(
+                    "scenario.calibrated must give envelope/rest for every EMG channel"
+                )
+            if set(cal.deadband) != joints:
+                raise ValueError("scenario.calibrated.deadband must give every joint")
         return self
 
 

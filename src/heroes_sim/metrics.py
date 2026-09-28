@@ -39,6 +39,13 @@ def max_excursion(log: pd.DataFrame, joint: str, of: str = "q") -> float:
     return float(np.max(np.abs(x - x[0])))
 
 
+def excursion_vs_baseline(log: pd.DataFrame, baseline: pd.DataFrame, joint: str) -> float:
+    """Largest |q - q_baseline|: arm motion caused by the controller and stim, with the
+    patient's own motion (the stim-off run, same seed) subtracted out."""
+    q, qb = log[f"q_{joint}"].to_numpy(), baseline[f"q_{joint}"].to_numpy()
+    return float(np.max(np.abs(q - qb)))
+
+
 def reference_drift_rate(log: pd.DataFrame, joint: str) -> float:
     """Mean |d ref / dt| in rad/s: how fast the reference wanders."""
     return float(np.mean(np.abs(log[f"ref_v_{joint}"].to_numpy())))

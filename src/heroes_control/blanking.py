@@ -9,8 +9,10 @@ Fill modes:
         (baseline wander, electrode DC) continuous, so the bandpass sees no edge.
   zero  set the window to 0. Cuts a rectangular notch out of any offset; the bandpass
         turns each notch into a transient that reads as EMG. Kept for comparison.
-Cost either way: volitional EMG inside the window is lost, so under stim the envelope
-reads low by roughly window / pulse period.
+Cost either way: volitional EMG inside the window is lost. With hold, the held sample
+keeps the envelope roughly level. With zero, the envelope reads low by the blanked
+fraction, and asymmetrically (only the stimulated side's channels see many zeros), so zero
+fill must be paired with `BlankingCorrection`; `ControllerConfig` enforces that.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 from collections import deque
 
 import numpy as np
+from scipy import signal
 
 FILL_MODES = ("hold", "zero")
 
@@ -35,6 +38,7 @@ class StimBlanking:
     def reset(self) -> None:
         self._pulses: deque[float] = deque()
         self._last = np.zeros(self._n)  # last unblanked sample (hold value)
+        self.last_mask = np.zeros(0, dtype=bool)  # blanked samples of the last chunk
 
     def on_pulse(self, t: float) -> None:
         """Stimulator fired at t; the samples after t within the window are blanked."""
@@ -54,6 +58,7 @@ class StimBlanking:
                 mask |= (since >= 1) & (since <= width)
             while self._pulses and round((t - self._pulses[0]) * self._fs) >= width:
                 self._pulses.popleft()
+        self.last_mask = mask
         if not mask.any():
             self._last = chunk[-1].copy()
             return chunk
@@ -72,3 +77,30 @@ class StimBlanking:
                 hold = chunk[i]
         self._last = hold.copy()
         return out
+
+
+class BlankingCorrection:
+    """Divide the envelope by the recently kept fraction of samples (zero-fill only).
+
+    The kept-sample indicator goes through the same lowpass as the envelope, so the
+    correction has the same dynamics as the bias it removes. It starts at steady state
+    (fraction 1), and is floored so a fully blanked stretch cannot divide by ~0.
+    """
+
+    def __init__(self, blanking: StimBlanking, sos: np.ndarray, floor: float = 0.2):
+        self._blanking = blanking
+        self._sos = np.asarray(sos, dtype=np.float64)
+        self._floor = floor
+        self.reset()
+
+    def reset(self) -> None:
+        self._zi = signal.sosfilt_zi(self._sos)[:, :, None]  # steady state for input 1
+
+    def process(self, t: float, chunk: np.ndarray) -> np.ndarray:
+        n = len(chunk)
+        if n == 0:
+            return chunk
+        mask = self._blanking.last_mask
+        kept = np.ones((n, 1)) if len(mask) != n else (~mask).astype(np.float64)[:, None]
+        frac, self._zi = signal.sosfilt(self._sos, kept, axis=0, zi=self._zi)
+        return chunk / np.maximum(frac, self._floor)

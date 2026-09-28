@@ -47,7 +47,11 @@ def test_mvc_group_must_exist():
         ({"controller.joints.r_elbow_flex.agonist": "deltoid"}, "EMG channel"),
         ({"safety.cap": {"biceps_stim": 0.8}}, "every stim channel"),
         ({"stim.channels.0.joint": "knee"}, "unknown"),
-        ({"scenario.mvc": {"biceps": 0.5}}, "every EMG channel"),
+        (
+            {"scenario.calibrated": {"envelope": {"biceps": 0.5}, "rest": {}, "deadband": {}}},
+            "every EMG channel",
+        ),
+        ({"controller.allocation": {"offset": 0.3, "epsilon": 0.0}}, "epsilon"),
         ({"timing.emg_hz": 1000}, "emg_hz must equal"),
     ],
 )

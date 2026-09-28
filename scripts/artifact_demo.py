@@ -3,7 +3,8 @@
     uv run python scripts/artifact_demo.py                       # sci_c5, both scenarios
     uv run python scripts/artifact_demo.py --patient configs/patients/healthy.yaml
 
-Runs each scenario with: clean EMG (M2 model), no blanking, zero-fill blanking, and
+Runs each scenario with: clean EMG (M2 model), no blanking, zero-fill blanking (with the
+envelope correction it requires), and
 sample-and-hold blanking. Each variant is calibrated first under its own EMG model (the
 clean model has a lower noise floor), as it would be on hardware.
 """
@@ -23,7 +24,10 @@ CLEAN = {
 VARIANTS = {
     "clean EMG (M2)": {**CLEAN, "controller.blanking_ms": 0},
     "no blanking": {"controller.blanking_ms": 0},
-    "zero-fill blanking": {"controller.blanking_fill": "zero"},
+    "zero-fill + correction": {
+        "controller.blanking_fill": "zero",
+        "controller.blanking_correction": True,
+    },
     "hold blanking": {},
 }
 
@@ -40,7 +44,7 @@ def main() -> None:
         j = base.plant.joints[0]
         print(f"\n{name} / {base.patient.name} / seed {args.seed}")
         print(
-            f"  {'variant':<20} {'ref drift':>9} {'track RMSE':>10} {'ref RMSE':>9} "
+            f"  {'variant':<24} {'ref drift':>9} {'track RMSE':>10} {'ref RMSE':>9} "
             f"{'dose bic':>8} {'dose tri':>8}  safety events"
         )
         for label, ov in VARIANTS.items():
@@ -51,8 +55,11 @@ def main() -> None:
             emg = [ch.name for ch in cfg.emg.channels]
             ov = {
                 **ov,
-                "scenario.mvc": dict(zip(emg, mvc.envelope)),
-                "scenario.mvc_rest": dict(zip(emg, mvc.baseline.tolist())),
+                "scenario.calibrated": {
+                    "envelope": dict(zip(emg, mvc.envelope)),
+                    "rest": dict(zip(emg, mvc.baseline.tolist())),
+                    "deadband": dict(zip(cfg.plant.joints, mvc.deadband)),
+                },
             }
             cfg = load_run_config(
                 scenarios / f"{name}.yaml", overrides=ov, patient_path=args.patient
@@ -71,7 +78,7 @@ def main() -> None:
             for e in res.events:
                 counts[e.rule] = counts.get(e.rule, 0) + 1
             print(
-                f"  {label:<20} {drift:>9} {track:>10} {ref:>9} "
+                f"  {label:<24} {drift:>9} {track:>10} {ref:>9} "
                 f"{doses[0]:>8.2f} {doses[1]:>8.2f}  {counts or ''}"
             )
 
