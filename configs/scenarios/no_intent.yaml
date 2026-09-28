@@ -3,4 +3,5 @@ name: no_intent
 patient_file: ../patients/healthy.yaml
 duration_s: 10.0
 initial_state: {q: [0.54], qd: [0.0]}
+closed_loop: true
 target: null                             # intends nothing: only cocontraction + motor noise

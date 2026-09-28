@@ -3,6 +3,7 @@ name: step_targets
 patient_file: ../patients/healthy.yaml
 duration_s: 16.0
 initial_state: {q: [0.54], qd: [0.0]}   # hanging posture
+closed_loop: true
 target:
   - {kind: hold, duration_s: 1.0}
   - {kind: step, duration_s: 3.0, q: [1.2]}

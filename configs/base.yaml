@@ -26,3 +26,65 @@ passive_drop:
 metrics:
   settle_s: 1.0
   step_jump_rad: 0.05
+
+calibration:                  # MVC protocol; runs before every closed-loop episode unless scenario.mvc is set
+  lock_q: [1.5708]            # isometric at 90 deg
+  rest_s: 2.0
+  window_s: 1.0
+  trials:
+    - {group: elbow_flexors, effort_s: 3.0}
+    - {group: elbow_extensors, effort_s: 3.0}
+
+emg:
+  channels:                   # weights = row of S[J, M]; off-target weights are crosstalk
+    - name: biceps
+      mvc_group: elbow_flexors
+      weights: {BIClong: 1.0, BICshort: 1.0, BRA: 0.3, TRIlong: 0.05, TRIlat: 0.05, TRImed: 0.02}
+    - name: triceps
+      mvc_group: elbow_extensors
+      weights: {TRIlong: 1.0, TRIlat: 1.0, TRImed: 0.5, BIClong: 0.05, BICshort: 0.05, BRA: 0.02}
+  volitional:
+    enabled: true
+    band_hz: [20.0, 450.0]
+    order: 4
+    amplitude_mv: {BIClong: 0.5, BICshort: 0.5, BRA: 0.5, TRIlong: 0.4, TRIlat: 0.4, TRImed: 0.4}
+  white_noise:
+    enabled: true
+    std_mv: 0.005
+
+angle_sensor:
+  noise_std_rad: 0.003
+  bias_walk_std_rad_per_sqrt_s: 0.001
+  latency_ms: 10.0
+  resolution_rad: 0.001
+
+stim:
+  n_steps: 128                # 7-bit digital pot
+  recruitment: {threshold: 0.35, slope: 12.0, saturation: 0.9}
+  em_delay_ms: 25.0
+  combine: probabilistic_sum
+  channels:                   # muscles = column of E[M, K]; off-target weights are crosstalk
+    - {name: biceps_stim, joint: r_elbow_flex, sign: 1, muscles: {BIClong: 0.9, BICshort: 0.9, BRA: 0.3}}
+    - {name: triceps_stim, joint: r_elbow_flex, sign: -1, muscles: {TRIlong: 0.8, TRIlat: 0.9, TRImed: 0.6}}
+
+controller:
+  bandpass_hz: [20.0, 450.0]
+  bandpass_order: 4
+  envelope_hz: 4.0
+  envelope_order: 2
+  deadband: 0.05
+  derivative_tau_s: 0.02
+  latency_ticks: 1            # 10 ms compute latency
+  joints:                     # kp >= ~1.2 limit-cycles for sci_c5 (loop delay: pulse hold + EMD)
+    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 10.0, rom: [0.1, 2.1], kp: 0.8, kd: 0.03}
+
+safety:
+  cap: {biceps_stim: 0.8, triceps_stim: 0.8}
+  max_rise_per_tick: 0.05
+  joint_limits: {r_elbow_flex: [0.0, 2.27]}
+  rom_margin_rad: 0.1
+  dose_window_s: 10.0
+  dose_max_mean: 0.5
+  watchdog_timeout_s: 0.05
+  q_plausible: {r_elbow_flex: [-0.3, 2.6]}
+  emg_plausible_abs_mv: 20.0

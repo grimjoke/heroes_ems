@@ -1,4 +1,4 @@
-"""Episode-level sanity checks (M1: open loop, volitional only)."""
+"""Episode-level sanity checks: open loop (M1) and closed loop (M2)."""
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,15 @@ from heroes_sim.runner import run
 
 J = "r_elbow_flex"
 SCI = "configs/patients/sci_c5.yaml"
+# Calibrated values (seed 0) so closed-loop tests skip the 12 s calibration.
+HEALTHY_MVC = {
+    "scenario.mvc": {"biceps": 0.5827, "triceps": 0.4644},
+    "scenario.mvc_rest": {"biceps": 0.0138, "triceps": 0.0113},
+}
+SCI_MVC = {
+    "scenario.mvc": {"biceps": 0.2036, "triceps": 0.0232},
+    "scenario.mvc_rest": {"biceps": 0.0115, "triceps": 0.0030},
+}
 
 
 def cfg_for(name, patient=None, **overrides):
@@ -19,38 +28,77 @@ def cfg_for(name, patient=None, **overrides):
     )
 
 
-def test_healthy_reaches_step_targets():
-    cfg = cfg_for("step_targets", **{"scenario.duration_s": 7.0})
+def q_at(log, t):
+    return log.loc[(log.t - t).abs().idxmin(), f"q_{J}"]
+
+
+def test_healthy_reaches_step_targets_open_loop():
+    cfg = cfg_for("step_targets", **{"scenario.duration_s": 7.0, "scenario.closed_loop": False})
     log = run(cfg, seed=0).log
     for t_end, tgt in ((3.95, 1.2), (6.95, 1.8)):  # end of each 3 s hold
-        q = log.loc[(log.t - t_end).abs().idxmin(), f"q_{J}"]
-        assert q == pytest.approx(tgt, abs=0.05)
+        assert q_at(log, t_end) == pytest.approx(tgt, abs=0.05)
+    assert "stim_biceps_stim" not in log  # no controller, no stim
 
 
-def test_no_intent_stays_near_rest():
-    log = run(cfg_for("no_intent", **{"scenario.duration_s": 5.0}), seed=0).log
-    assert metrics.max_excursion(log, J) < 0.1
-    assert log[f"target_{J}"].isna().all()
-
-
-def test_mvc_torque_signs_and_impairment():
+def test_mvc_calibration_values_and_impairment():
     out = {}
     for patient in (None, SCI):
-        res = run(cfg_for("mvc_calibration", patient, **{"scenario.rest_s": 0.5}), seed=0)
-        out[patient] = {r.group: r for r in res.mvc}
+        res = run(cfg_for("mvc_calibration", patient, **{"calibration.rest_s": 1.0}), seed=0)
+        cal = res.calibration
+        out[patient] = ({r.group: r for r in cal.trials}, cal.mvc)
         assert res.log[f"q_{J}"].eq(res.log[f"q_{J}"].iloc[0]).all()  # isometric
-    healthy, sci = out[None], out[SCI]
-    assert healthy["elbow_flexors"].torque[0] > 30 and healthy["elbow_extensors"].torque[0] < -20
-    assert healthy["elbow_flexors"].activation[:3].min() > 0.9
-    assert 0 < sci["elbow_flexors"].torque[0] < healthy["elbow_flexors"].torque[0]
-    assert sci["elbow_extensors"].torque[0] > healthy["elbow_extensors"].torque[0]
+        # Rest floor is a noticeable fraction of a near-paralysed channel's MVC (~13% for the
+        # sci_c5 triceps), which is why normalization subtracts it.
+        assert all(0 < r < 0.25 * m for r, m in zip(cal.mvc.rest, cal.mvc.envelope))
+    (h_trials, h_mvc), (s_trials, s_mvc) = out[None], out[SCI]
+    assert h_trials["elbow_flexors"].torque[0] > 30 and h_trials["elbow_extensors"].torque[0] < -20
+    assert 0 < s_trials["elbow_flexors"].torque[0] < h_trials["elbow_flexors"].torque[0]
+    # Near-paralysed triceps: much smaller MVC envelope than healthy.
+    assert s_mvc.envelope[1] < 0.2 * h_mvc.envelope[1]
+
+
+def test_calibration_runs_before_closed_loop_episode():
+    cfg = cfg_for("no_intent", **{"scenario.duration_s": 1.0, "calibration.rest_s": 0.5})
+    res = run(cfg, seed=0)
+    assert res.calibration is not None and res.mvc == res.calibration.mvc
+
+
+@pytest.mark.parametrize("patient,mvc", [(None, HEALTHY_MVC), (SCI, SCI_MVC)])
+def test_no_intent_closed_loop_is_quiet(patient, mvc):
+    """Key safety scenario: no intent -> reference holds, little stim, no oscillation."""
+    log = run(cfg_for("no_intent", patient, **mvc), seed=0).log
+    assert metrics.max_excursion(log, J, of="ref") < 0.05
+    assert metrics.max_excursion(log, J) < 0.25
+    for ch in ("biceps_stim", "triceps_stim"):
+        assert metrics.stim_dose(log, ch) < 1.0  # intensity-seconds over 10 s
+        assert metrics.time_at_cap(log, ch, 0.8) == 0.0
+
+
+@pytest.mark.parametrize("patient,mvc", [(None, HEALTHY_MVC), (SCI, SCI_MVC)])
+def test_step_targets_closed_loop_tracks(patient, mvc):
+    cfg = cfg_for("step_targets", patient, **mvc)
+    res = run(cfg, seed=0)
+    log = res.log
+    assert metrics.tracking_rmse(log, J, cfg.metrics) < 0.25
+    assert log["stim_biceps_stim"].max() > 0.05  # stim actually participates
+    assert not any(e.rule in ("watchdog", "sensor_sanity") for e in res.events)
+
+
+def test_closed_loop_helps_impaired_hold():
+    """sci_c5 alone sags below the 1.8 rad target; stim assistance holds it higher."""
+    base = {"scenario.duration_s": 7.0, **SCI_MVC}
+    open_log = run(cfg_for("step_targets", SCI, **base, **{"scenario.closed_loop": False}), 0).log
+    closed_log = run(cfg_for("step_targets", SCI, **base), 0).log
+    hold = slice(6.0, 7.0)
+    q_open = open_log.set_index("t").loc[hold, f"q_{J}"].mean()
+    q_closed = closed_log.set_index("t").loc[hold, f"q_{J}"].mean()
+    assert abs(1.8 - q_closed) < abs(1.8 - q_open)
 
 
 def test_same_seed_identical_parquet(tmp_path):
-    cfg = cfg_for("no_intent", **{"scenario.duration_s": 1.0})
-    paths = [
-        write_run(tmp_path / str(i), run(cfg, seed=s).log, cfg, s) for i, s in enumerate((3, 3, 4))
-    ]
+    cfg = cfg_for("step_targets", **{"scenario.duration_s": 2.0, **HEALTHY_MVC})
+    runs = [(s, run(cfg, seed=s)) for s in (3, 3, 4)]
+    paths = [write_run(tmp_path / str(i), r.log, cfg, s) for i, (s, r) in enumerate(runs)]
     blobs = [(p / "log.parquet").read_bytes() for p in paths]
     assert blobs[0] == blobs[1]
     a, c = (pd.read_parquet(p / "log.parquet") for p in (paths[0], paths[2]))

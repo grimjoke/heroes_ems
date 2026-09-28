@@ -37,5 +37,29 @@ def test_mvc_group_must_exist():
     with pytest.raises(ValidationError, match="not in plant.muscle_groups"):
         load_run_config(
             "configs/scenarios/mvc_calibration.yaml",
-            overrides={"scenario.trials": [{"group": "hamstrings", "effort_s": 2.0}]},
+            overrides={"calibration.trials": [{"group": "hamstrings", "effort_s": 2.0}]},
         )
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"controller.joints.r_elbow_flex.agonist": "deltoid"}, "EMG channel"),
+        ({"safety.cap": {"biceps_stim": 0.8}}, "every stim channel"),
+        ({"stim.channels.0.joint": "knee"}, "unknown"),
+        ({"scenario.mvc": {"biceps": 0.5}}, "every EMG channel"),
+        ({"timing.emg_hz": 1000}, "emg_hz must equal"),
+    ],
+)
+def test_cross_section_names_checked(overrides, match):
+    # stim.channels is a list; the dotted-override helper indexes dicts only.
+    if "stim.channels.0.joint" in overrides:
+        cfg = load_run_config(SC)
+        raw = cfg.model_dump()
+        raw["stim"]["channels"][0]["joint"] = "knee"
+        raw["scenario"] = cfg.scenario.model_dump()
+        with pytest.raises(ValidationError, match=match):
+            type(cfg).model_validate(raw)
+        return
+    with pytest.raises(ValidationError, match=match):
+        load_run_config(SC, overrides=overrides)
