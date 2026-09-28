@@ -1,25 +1,89 @@
-"""Wires plant, patient and scenario; runs one episode. M1: open loop (no controller/stim)."""
+"""Wires everything and runs one episode.
+
+Per physics step: intent -> patient u_vol -> stim u_stim -> combine -> plant.
+Clock ticks: angle sensor sample; controller tick (EMG chunk -> controller -> latency
+queue -> safety supervisor -> applied intensity); stim pulse (latches applied intensity).
+Closed-loop movement episodes calibrate MVC first (as on hardware) unless given.
+"""
 
 from __future__ import annotations
 
 import zlib
+from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
+from heroes_control import (
+    ControllerConfig,
+    ControllerPipeline,
+    MVCValues,
+    default_front_end,
+)
+from heroes_safety import RULES, SafetyConfig, SafetyEvent, SafetySupervisor
 from heroes_sim.config import MovementScenario, MVCScenario, SimConfig
 from heroes_sim.patient import NO_INTENT, Intent, Patient
 from heroes_sim.plant import Plant
 from heroes_sim.scenario import MVCSchedule, TargetTrajectory
 from heroes_sim.scheduler import Scheduler
+from heroes_sim.sensors.emg import EMGSensor
+from heroes_sim.sensors.kinematics import AngleSensor
+from heroes_sim.stim import StimModel
 
 
 def make_rng(seed: int, component: str) -> np.random.Generator:
     """Per-component stream from the run seed. Keyed by name, so adding a component
     never shifts another component's stream."""
     return np.random.default_rng(np.random.SeedSequence([seed, zlib.crc32(component.encode())]))
+
+
+def build_controller_config(cfg: SimConfig) -> ControllerConfig:
+    """Resolve the name-based YAML sections into the controller's index-based config."""
+    c, emg = cfg.controller, [ch.name for ch in cfg.emg.channels]
+    joints = [c.joints[j] for j in cfg.plant.joints]
+    return ControllerConfig(
+        emg_fs_hz=float(cfg.timing.emg_hz),
+        tick_hz=float(cfg.timing.controller_hz),
+        n_emg=len(emg),
+        bandpass_hz=c.bandpass_hz,
+        bandpass_order=c.bandpass_order,
+        envelope_hz=c.envelope_hz,
+        envelope_order=c.envelope_order,
+        agonist=tuple(emg.index(j.agonist) for j in joints),
+        antagonist=tuple(emg.index(j.antagonist) for j in joints),
+        deadband=c.deadband,
+        gain=tuple(j.gain for j in joints),
+        damping=tuple(j.damping for j in joints),
+        q_min=tuple(j.rom[0] for j in joints),
+        q_max=tuple(j.rom[1] for j in joints),
+        kp=tuple(j.kp for j in joints),
+        kd=tuple(j.kd for j in joints),
+        derivative_tau_s=c.derivative_tau_s,
+        channel_joint=tuple(cfg.plant.joints.index(ch.joint) for ch in cfg.stim.channels),
+        channel_sign=tuple(ch.sign for ch in cfg.stim.channels),
+    )
+
+
+def build_safety_config(cfg: SimConfig) -> SafetyConfig:
+    s, joints, chans = cfg.safety, cfg.plant.joints, cfg.stim.channels
+    return SafetyConfig(
+        tick_hz=float(cfg.timing.controller_hz),
+        channel_joint=tuple(joints.index(ch.joint) for ch in chans),
+        channel_sign=tuple(ch.sign for ch in chans),
+        cap=tuple(s.cap[ch.name] for ch in chans),
+        max_rise_per_tick=s.max_rise_per_tick,
+        q_limit_min=tuple(s.joint_limits[j][0] for j in joints),
+        q_limit_max=tuple(s.joint_limits[j][1] for j in joints),
+        rom_margin_rad=s.rom_margin_rad,
+        dose_window_s=s.dose_window_s,
+        dose_max_mean=s.dose_max_mean,
+        watchdog_timeout_s=s.watchdog_timeout_s,
+        q_plausible_min=tuple(s.q_plausible[j][0] for j in joints),
+        q_plausible_max=tuple(s.q_plausible[j][1] for j in joints),
+        emg_plausible_abs=s.emg_plausible_abs_mv,
+    )
 
 
 @dataclass(frozen=True)
@@ -32,86 +96,30 @@ class MVCTrialResult:
 
 
 @dataclass(frozen=True)
+class Calibration:
+    log: pd.DataFrame
+    trials: list[MVCTrialResult]
+    mvc: MVCValues  # per EMG channel: best-window envelope in its group's trial + rest
+
+
+@dataclass(frozen=True)
 class RunResult:
     log: pd.DataFrame  # controller-rate log
-    mvc: list[MVCTrialResult] | None = None
+    mvc: MVCValues | None = None
+    calibration: Calibration | None = None  # when calibration ran in this run
+    events: list[SafetyEvent] = field(default_factory=list)
 
 
 StepHook = Callable[[Plant], None]
 
 
-def _require(cfg: SimConfig) -> None:
+def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult:
     if cfg.patient is None or cfg.scenario is None:
         raise ValueError("run config needs `patient` and `scenario` (use load_run_config)")
-
-
-def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult:
-    _require(cfg)
-    if isinstance(cfg.scenario, MVCScenario):
-        return run_mvc(cfg, seed, on_step)
-    return RunResult(log=run_movement(cfg, seed, on_step))
-
-
-def _episode(
-    cfg: SimConfig,
-    seed: int,
-    duration_s: float,
-    intent_at: Callable[[float], Intent],
-    q0: np.ndarray,
-    qd0: np.ndarray,
-    lock: bool,
-    on_step: StepHook | None,
-) -> pd.DataFrame:
-    plant = Plant(cfg.plant, cfg.timing)
-    plant.reset(q0, qd0)
-    if lock:
-        plant.lock(q0)
-    patient = Patient(cfg.patient, cfg.plant, plant.action, plant.dt, make_rng(seed, "patient"))
-    sched = Scheduler(cfg.timing)
-
-    n_steps = round(duration_s * cfg.timing.physics_hz)
-    n_log = n_steps // (cfg.timing.physics_hz // cfg.timing.controller_hz)
-    joints, muscles = cfg.plant.joints, cfg.plant.muscles
-    nj, nm = len(joints), len(muscles)
-    t_log = np.empty(n_log)
-    target, q_log, qd_log, tau_log = (np.empty((n_log, nj)) for _ in range(4))
-    u_log, act_log = np.empty((n_log, nm)), np.empty((n_log, nm))
-    group_log = np.empty(n_log, dtype=object)
-
-    k = 0
-    for _ in range(n_steps):
-        intent = intent_at(sched.t)
-        q, qd = plant.joint_state()
-        u_vol = patient.step(intent, q, qd)
-        plant.step(u_vol)
-        if on_step is not None:
-            on_step(plant)
-        if sched.advance().controller:
-            q, qd = plant.joint_state()
-            t_log[k] = sched.t
-            target[k] = np.nan if intent.target is None else intent.target
-            q_log[k], qd_log[k], tau_log[k] = q, qd, plant.actuator_torque()
-            u_log[k], act_log[k] = u_vol, plant.muscle_state().activation
-            group_log[k] = intent.mvc_group or ""
-            k += 1
-
-    cols: dict[str, np.ndarray] = {"t": t_log}
-    for j, name in enumerate(joints):
-        cols |= {
-            f"target_{name}": target[:, j],
-            f"q_{name}": q_log[:, j],
-            f"qd_{name}": qd_log[:, j],
-            f"torque_{name}": tau_log[:, j],
-        }
-    for m, name in enumerate(muscles):
-        cols |= {f"u_vol_{name}": u_log[:, m], f"act_{name}": act_log[:, m]}
-    cols["mvc_group"] = group_log
-    return pd.DataFrame(cols)
-
-
-def run_movement(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> pd.DataFrame:
-    _require(cfg)
     sc = cfg.scenario
+    if isinstance(sc, MVCScenario):
+        cal = calibrate(cfg, seed, "", on_step)
+        return RunResult(log=cal.log, mvc=cal.mvc, calibration=cal)
     assert isinstance(sc, MovementScenario)
     q0 = np.asarray(sc.initial_state.q, dtype=np.float64)
     qd0 = np.asarray(sc.initial_state.qd, dtype=np.float64)
@@ -125,41 +133,219 @@ def run_movement(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> 
         def intent_at(t: float) -> Intent:
             return Intent(target=traj(t))
 
-    return _episode(cfg, seed, sc.duration_s, intent_at, q0, qd0, False, on_step)
+    cal, mvc = None, None
+    if sc.closed_loop:
+        if sc.mvc is not None:
+            names = [ch.name for ch in cfg.emg.channels]
+            mvc = MVCValues(
+                tuple(sc.mvc[n] for n in names),
+                None if sc.mvc_rest is None else tuple(sc.mvc_rest[n] for n in names),
+            )
+        else:
+            cal = calibrate(cfg, seed, "calibration/", None)
+            mvc = cal.mvc
+    ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=mvc)
+    log = ep.run(sc.duration_s, intent_at, on_step)
+    return RunResult(log=log, mvc=mvc, calibration=cal, events=ep.events)
 
 
-def run_mvc(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult:
-    """Isometric max-effort trial per muscle group with the joint locked, as on hardware.
-
-    M2 adds the EMG envelope to the log; the controller's MVC values come from that.
-    """
-    _require(cfg)
-    sc = cfg.scenario
-    assert isinstance(sc, MVCScenario)
-    sched = MVCSchedule(sc)
-    lock_q = np.asarray(sc.lock_q, dtype=np.float64)
+def calibrate(cfg: SimConfig, seed: int, prefix: str, on_step: StepHook | None) -> Calibration:
+    """MVC trials with the joint locked; EMG through the controller's own front end."""
+    cal = cfg.calibration
+    sched = MVCSchedule(cal)
+    lock_q = np.asarray(cal.lock_q, dtype=np.float64)
 
     def intent_at(t: float) -> Intent:
         g = sched.group_at(t)
         return NO_INTENT if g is None else Intent(mvc_group=g)
 
-    log = _episode(
-        cfg, seed, sched.duration_s, intent_at, lock_q, np.zeros_like(lock_q), True, on_step
-    )
-    return RunResult(log=log, mvc=[_best_window(cfg, sc, log, w.group) for w in sched.windows])
+    ep = _Episode(cfg, seed, prefix, lock_q, np.zeros_like(lock_q), lock=True, mvc=None)
+    log = ep.run(sched.duration_s, intent_at, on_step)
+    trials = [_best_window(cfg, log, w.group) for w in sched.windows]
+    w = round(cal.window_s * cfg.timing.controller_hz)
+    t = log["t"].to_numpy()
+    # Rest baseline: the last window_s before each effort cue (envelope settled, no effort).
+    at_rest = np.zeros(len(t), dtype=bool)
+    for win in sched.windows:
+        at_rest |= (t > win.t_start - cal.window_s) & (t <= win.t_start)
+    mvc, rest = [], []
+    for ch in cfg.emg.channels:
+        env = log[f"env_{ch.name}"].to_numpy()
+        mvc.append(float(_best_mean(env[log["mvc_group"] == ch.mvc_group], w)[0]))
+        rest.append(float(env[at_rest].mean()))
+    return Calibration(log=log, trials=trials, mvc=MVCValues(tuple(mvc), tuple(rest)))
 
 
-def _best_window(cfg: SimConfig, sc: MVCScenario, log: pd.DataFrame, group: str) -> MVCTrialResult:
+def _best_mean(x: np.ndarray, w: int) -> tuple[float, int]:
+    """Highest mean over any w consecutive samples of x, and where it starts."""
+    csum = np.concatenate([[0.0], np.cumsum(x)])
+    sums = csum[w:] - csum[:-w]
+    start = int(np.argmax(sums))
+    return sums[start] / w, start
+
+
+def _best_window(cfg: SimConfig, log: pd.DataFrame, group: str) -> MVCTrialResult:
     rows = log[log["mvc_group"] == group]
     members = cfg.plant.muscle_groups[group].muscles
+    w = round(cfg.calibration.window_s * cfg.timing.controller_hz)
+    _, start = _best_mean(rows[[f"act_{m}" for m in members]].to_numpy().mean(axis=1), w)
     act = rows[[f"act_{m}" for m in cfg.plant.muscles]].to_numpy()
     tau = rows[[f"torque_{j}" for j in cfg.plant.joints]].to_numpy()
-    w = round(sc.window_s * cfg.timing.controller_hz)
-    score = rows[[f"act_{m}" for m in members]].to_numpy().mean(axis=1)
-    csum = np.concatenate([[0.0], np.cumsum(score)])
-    start = int(np.argmax(csum[w:] - csum[:-w]))
     return MVCTrialResult(
         group=group,
         activation=act[start : start + w].mean(axis=0),
         torque=tau[start : start + w].mean(axis=0),
     )
+
+
+class _Log:
+    """Preallocated controller-rate columns; unset values stay NaN."""
+
+    def __init__(self, n: int):
+        self.n, self.cols = n, {}
+
+    def put(self, k: int, prefix: str, names: list[str], values: np.ndarray) -> None:
+        for name, v in zip(names, values, strict=True):
+            key = f"{prefix}_{name}"
+            if key not in self.cols:
+                self.cols[key] = np.full(self.n, np.nan)
+            self.cols[key][k] = v
+
+
+class _Episode:
+    def __init__(
+        self,
+        cfg: SimConfig,
+        seed: int,
+        prefix: str,
+        q0: np.ndarray,
+        qd0: np.ndarray,
+        lock: bool,
+        mvc: MVCValues | None,
+    ):
+        self.cfg = cfg
+        t = cfg.timing
+        self.plant = Plant(cfg.plant, t)
+        self.plant.reset(q0, qd0)
+        if lock:
+            self.plant.lock(q0)
+        dt = self.plant.dt
+        self.patient = Patient(
+            cfg.patient, cfg.plant, self.plant.action, dt, make_rng(seed, prefix + "patient")
+        )
+        self.emg = EMGSensor(
+            cfg.emg,
+            cfg.plant.muscles,
+            float(t.emg_hz),
+            make_rng(seed, prefix + "emg/volitional"),
+            make_rng(seed, prefix + "emg/noise"),
+        )
+        self.angle = AngleSensor(
+            cfg.angle_sensor,
+            self.plant.n_joints,
+            dt,
+            1.0 / t.angle_sensor_hz,
+            make_rng(seed, prefix + "angle_sensor"),
+        )
+        self.angle.reset(q0)
+        self.q_meas = np.asarray(q0, dtype=np.float64).copy()
+        self.ctrl_cfg = build_controller_config(cfg)
+        self.closed_loop = mvc is not None
+        if self.closed_loop:
+            self.controller = ControllerPipeline(self.ctrl_cfg, mvc)
+            self.controller.reset(q0)
+            self.supervisor = SafetySupervisor(build_safety_config(cfg))
+            self.stim = StimModel(cfg.stim, cfg.plant.muscles, dt)
+            # Output computed at tick n reaches the supervisor at tick n + latency_ticks.
+            # Before the first real output arrives the stimulator sees a zero command.
+            n_lat = cfg.controller.latency_ticks
+            self._queue = deque([(0.0, np.zeros(len(cfg.stim.channels)))] * n_lat)
+        else:
+            self.front_end = default_front_end(self.ctrl_cfg)
+        self.events: list[SafetyEvent] = []
+
+    def run(
+        self, duration_s: float, intent_at: Callable[[float], Intent], on_step: StepHook | None
+    ) -> pd.DataFrame:
+        cfg, plant = self.cfg, self.plant
+        t = cfg.timing
+        sched = Scheduler(t)
+        n_steps = round(duration_s * t.physics_hz)
+        per_tick = t.physics_hz // t.controller_hz
+        log = _Log(n_steps // per_tick)
+        joints, muscles = cfg.plant.joints, cfg.plant.muscles
+        emg_names = self.emg.names
+        stim_names = [ch.name for ch in cfg.stim.channels]
+        n_stim = len(stim_names)
+        applied = np.zeros(n_stim)
+        u_buf = np.zeros((per_tick, len(muscles)))
+        u_stim = np.zeros(len(muscles))
+        groups = np.empty(log.n, dtype=object)
+        k = i = 0
+        for _ in range(n_steps):
+            intent = intent_at(sched.t)
+            q, qd = plant.joint_state()
+            u_vol = self.patient.step(intent, q, qd)
+            u_buf[i] = u_vol
+            i += 1
+            if self.closed_loop:
+                u_stim = self.stim.step()
+                plant.step(self.stim.combine(u_vol, u_stim))
+            else:
+                plant.step(u_vol)
+            if on_step is not None:
+                on_step(plant)
+            ticks = sched.advance()
+            now = sched.t
+            q, qd = plant.joint_state()
+            self.angle.push(q)
+            if ticks.angle_sensor:
+                self.q_meas = self.angle.sample()
+            if not ticks.controller:
+                if ticks.stim and self.closed_loop:
+                    self.stim.pulse(now, applied)
+                continue
+
+            emg_chunk = self.emg.chunk(u_buf[:i])
+            i = 0
+            if self.closed_loop:
+                out = self.controller.step(now, emg_chunk, self.q_meas)
+                self._queue.append((out.t, out.intensity))
+                cmd_t, cmd = self._queue.popleft()
+                safe = self.supervisor.step(now, cmd, cmd_t, self.q_meas, emg_chunk)
+                applied = safe.intensity
+                env, norm = out.envelope, out.normalized
+                log.put(k, "intent", joints, out.intent)
+                log.put(k, "ref_v", joints, out.ref_velocity)
+                log.put(k, "ref", joints, out.ref_angle)
+                log.put(k, "error", joints, out.error)
+                log.put(k, "pd", joints, out.pd_output)
+                log.put(k, "norm", emg_names, norm)
+                log.put(k, "cmd", stim_names, out.intensity)
+                log.put(k, "stim", stim_names, applied)
+                log.put(k, "safety", list(RULES), [f.any() for f in safe.fired.values()])
+            else:
+                env = self.front_end.process(now, emg_chunk)[-1]
+            if ticks.stim and self.closed_loop:
+                self.stim.pulse(now, applied)
+
+            target = np.full(len(joints), np.nan) if intent.target is None else intent.target
+            log.put(k, "t", ["s"], [now])
+            log.put(k, "target", joints, target)
+            log.put(k, "q", joints, q)
+            log.put(k, "qd", joints, qd)
+            log.put(k, "q_meas", joints, self.q_meas)
+            log.put(k, "torque", joints, plant.actuator_torque())
+            log.put(k, "env", emg_names, env)
+            log.put(k, "u_vol", muscles, u_vol)
+            log.put(k, "u_stim", muscles, u_stim)
+            log.put(k, "act", muscles, plant.muscle_state().activation)
+            groups[k] = intent.mvc_group or ""
+            k += 1
+
+        if self.closed_loop:
+            self.events = list(self.supervisor.events)
+        cols = log.cols
+        df = pd.DataFrame({"t": cols.pop("t_s"), **cols})
+        df["mvc_group"] = groups
+        return df

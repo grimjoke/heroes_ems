@@ -1,4 +1,5 @@
-"""One run -> log.parquet + meta.json (resolved config, seed, git hash, package versions)."""
+"""One run -> log.parquet, events.parquet (safety), meta.json (resolved config, seed, git
+hash, package versions, summary)."""
 
 from __future__ import annotations
 
@@ -36,10 +37,13 @@ def write_run(
     cfg: SimConfig,
     seed: int,
     extra: dict[str, Any] | None = None,
+    events: pd.DataFrame | None = None,
 ) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pandas(log, preserve_index=False), out / "log.parquet")
+    if events is not None:
+        pq.write_table(pa.Table.from_pandas(events, preserve_index=False), out / "events.parquet")
     meta = {
         "seed": seed,
         "git": git_hash(),

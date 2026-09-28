@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from heroes_sim.config import MovementScenario, MVCScenario
+from heroes_sim.config import CalibrationConfig, MovementScenario
 from heroes_sim.scenario import MVCSchedule, TargetTrajectory
 
 
@@ -13,6 +13,7 @@ def traj(segments, q0=0.5):
             "duration_s": 1.0,
             "initial_state": {"q": [q0], "qd": [0.0]},
             "target": segments,
+            "closed_loop": False,
         }
     )
     return TargetTrajectory(sc.target, np.array([q0]))
@@ -35,10 +36,8 @@ def test_segments():
 
 
 def test_mvc_schedule():
-    sc = MVCScenario.model_validate(
+    sc = CalibrationConfig.model_validate(
         {
-            "kind": "mvc",
-            "name": "m",
             "lock_q": [1.0],
             "rest_s": 1.0,
             "window_s": 0.5,
@@ -53,10 +52,8 @@ def test_mvc_schedule():
 
 def test_window_longer_than_effort_rejected():
     with pytest.raises(ValueError, match="window_s"):
-        MVCScenario.model_validate(
+        CalibrationConfig.model_validate(
             {
-                "kind": "mvc",
-                "name": "m",
                 "lock_q": [1.0],
                 "rest_s": 0.0,
                 "window_s": 2.0,

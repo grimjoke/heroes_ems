@@ -10,8 +10,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from heroes_sim.config import (
+    CalibrationConfig,
     HoldSegment,
-    MVCScenario,
     RampSegment,
     Segment,
     SineSegment,
@@ -65,7 +65,7 @@ class MVCWindow:
 class MVCSchedule:
     """Rest, then max effort, for each trial in order."""
 
-    def __init__(self, sc: MVCScenario):
+    def __init__(self, sc: CalibrationConfig):
         windows, t = [], 0.0
         for tr in sc.trials:
             t += sc.rest_s

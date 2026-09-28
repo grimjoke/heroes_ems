@@ -124,6 +124,96 @@ class MovementScenario(_Strict):
     initial_state: InitialState
     target: list[Segment] | None  # None -> patient intends nothing (no_intent)
     duration_s: float = Field(gt=0)
+    closed_loop: bool  # false: volitional only, no controller or stim
+    mvc: dict[str, float] | None = None  # EMG channel -> MVC envelope; None -> calibrate first
+    mvc_rest: dict[str, float] | None = None  # EMG channel -> resting envelope (with `mvc`)
+
+
+class EMGChannelConfig(_Strict):
+    name: str
+    mvc_group: str  # muscle group whose MVC trial calibrates this channel
+    weights: dict[str, float]  # muscle -> pickup weight (row of S[J, M]); crosstalk < 1
+
+
+class VolitionalEMGConfig(_Strict):
+    enabled: bool
+    band_hz: tuple[float, float]  # bandlimited-noise carrier
+    order: int = Field(ge=1)
+    amplitude_mv: dict[str, float]  # per muscle: carrier RMS at full excitation
+
+
+class WhiteNoiseConfig(_Strict):
+    enabled: bool
+    std_mv: float = Field(ge=0)
+
+
+class EMGConfig(_Strict):
+    channels: list[EMGChannelConfig] = Field(min_length=1)
+    volitional: VolitionalEMGConfig
+    white_noise: WhiteNoiseConfig
+
+
+class AngleSensorConfig(_Strict):
+    noise_std_rad: float = Field(ge=0)
+    bias_walk_std_rad_per_sqrt_s: float = Field(ge=0)
+    latency_ms: float = Field(ge=0)
+    resolution_rad: float = Field(ge=0)  # 0 -> no quantization
+
+
+class RecruitmentConfig(_Strict):
+    """Sigmoid intensity -> recruitment fraction, shifted so zero intensity recruits nothing."""
+
+    threshold: float = Field(ge=0, le=1)  # intensity at the sigmoid midpoint
+    slope: float = Field(gt=0)  # per unit intensity
+    saturation: float = Field(gt=0, le=1)  # recruitment at full intensity
+
+
+class StimChannelConfig(_Strict):
+    name: str
+    joint: str
+    sign: Literal[1, -1]  # direction this electrode drives the joint (+1 flexion)
+    muscles: dict[str, float]  # muscle -> recruitment weight (column of E[M, K]); crosstalk < 1
+
+
+class StimConfig(_Strict):
+    n_steps: int = Field(ge=2)  # digital-pot quantization levels
+    recruitment: RecruitmentConfig
+    em_delay_ms: float = Field(ge=0)
+    combine: Literal["probabilistic_sum"]
+    channels: list[StimChannelConfig] = Field(min_length=1)
+
+
+class JointControlConfig(_Strict):
+    agonist: str  # EMG channel name
+    antagonist: str
+    gain: float = Field(ge=0)  # rad/s^2 per unit intent
+    damping: float = Field(ge=0)  # 1/s; 0 = pure double integration
+    rom: tuple[float, float]  # reference clamp
+    kp: float = Field(ge=0)
+    kd: float = Field(ge=0)
+
+
+class ControllerSection(_Strict):
+    bandpass_hz: tuple[float, float]
+    bandpass_order: int = Field(ge=1)
+    envelope_hz: float = Field(gt=0)
+    envelope_order: int = Field(ge=1)
+    deadband: float = Field(ge=0, lt=1)
+    derivative_tau_s: float = Field(ge=0)
+    latency_ticks: int = Field(ge=0)  # compute latency before output takes effect
+    joints: dict[str, JointControlConfig]
+
+
+class SafetySection(_Strict):
+    cap: dict[str, float]  # stim channel -> max intensity
+    max_rise_per_tick: float = Field(gt=0)
+    joint_limits: dict[str, tuple[float, float]]  # ROM guard limits
+    rom_margin_rad: float = Field(ge=0)
+    dose_window_s: float = Field(gt=0)
+    dose_max_mean: float = Field(gt=0, le=1)
+    watchdog_timeout_s: float = Field(gt=0)
+    q_plausible: dict[str, tuple[float, float]]
+    emg_plausible_abs_mv: float = Field(gt=0)
 
 
 class MVCTrial(_Strict):
@@ -131,20 +221,27 @@ class MVCTrial(_Strict):
     effort_s: float = Field(gt=0)
 
 
-class MVCScenario(_Strict):
-    kind: Literal["mvc"]
-    name: str
+class CalibrationConfig(_Strict):
+    """MVC protocol: isometric max effort per muscle group, joint locked at lock_q."""
+
     lock_q: list[float]
     rest_s: float = Field(ge=0)
     trials: list[MVCTrial] = Field(min_length=1)
     window_s: float = Field(gt=0)  # MVC value = mean over the best window within each effort
 
     @model_validator(mode="after")
-    def _window_fits(self) -> MVCScenario:
+    def _window_fits(self) -> CalibrationConfig:
         for tr in self.trials:
             if self.window_s > tr.effort_s:
                 raise ValueError(f"window_s {self.window_s} > effort_s {tr.effort_s}")
         return self
+
+
+class MVCScenario(_Strict):
+    """Runs the `calibration` protocol on its own."""
+
+    kind: Literal["mvc"]
+    name: str
 
 
 Scenario = Annotated[MovementScenario | MVCScenario, Field(discriminator="kind")]
@@ -165,6 +262,12 @@ class SimConfig(_Strict):
     plant: PlantConfig
     passive_drop: PassiveDropConfig | None = None
     metrics: MetricsConfig | None = None
+    calibration: CalibrationConfig | None = None
+    emg: EMGConfig | None = None
+    angle_sensor: AngleSensorConfig | None = None
+    stim: StimConfig | None = None
+    controller: ControllerSection | None = None
+    safety: SafetySection | None = None
     patient: PatientConfig | None = None
     scenario: Scenario | None = None
 
@@ -191,12 +294,57 @@ class SimConfig(_Strict):
                 vecs += [getattr(seg, f) for f in ("q", "center", "amplitude") if hasattr(seg, f)]
             if any(len(v) != n for v in vecs):
                 raise ValueError(f"scenario joint vectors must have length {n}")
-        elif isinstance(sc, MVCScenario):
-            if len(sc.lock_q) != n:
-                raise ValueError(f"scenario.lock_q must have length {n}")
-            for tr in sc.trials:
+        if self.calibration is not None:
+            if len(self.calibration.lock_q) != n:
+                raise ValueError(f"calibration.lock_q must have length {n}")
+            for tr in self.calibration.trials:
                 if tr.group not in self.plant.muscle_groups:
                     raise ValueError(f"MVC trial group '{tr.group}' not in plant.muscle_groups")
+        return self
+
+    @model_validator(mode="after")
+    def _names_match(self) -> SimConfig:
+        """Every name used by emg/stim/controller/safety must exist where it points."""
+        joints, muscles = set(self.plant.joints), set(self.plant.muscles)
+
+        def need(names, universe, where: str) -> None:
+            missing = set(names) - set(universe)
+            if missing:
+                raise ValueError(f"{where}: unknown {sorted(missing)}")
+
+        emg_names: list[str] = []
+        if self.emg is not None:
+            if self.timing.emg_hz != self.timing.physics_hz:
+                raise ValueError("timing.emg_hz must equal physics_hz (1 sample per step)")
+            emg_names = [c.name for c in self.emg.channels]
+            for c in self.emg.channels:
+                need(c.weights, muscles, f"emg channel '{c.name}' weights")
+                need([c.mvc_group], self.plant.muscle_groups, f"emg channel '{c.name}' mvc_group")
+            need(self.emg.volitional.amplitude_mv, muscles, "emg.volitional.amplitude_mv")
+        stim_names: list[str] = []
+        if self.stim is not None:
+            stim_names = [c.name for c in self.stim.channels]
+            for c in self.stim.channels:
+                need([c.joint], joints, f"stim channel '{c.name}' joint")
+                need(c.muscles, muscles, f"stim channel '{c.name}' muscles")
+        if self.controller is not None:
+            if set(self.controller.joints) != joints:
+                raise ValueError("controller.joints must list every plant joint")
+            for j, jc in self.controller.joints.items():
+                need([jc.agonist, jc.antagonist], emg_names, f"controller.joints.{j} EMG channel")
+        if self.safety is not None:
+            if set(self.safety.cap) != set(stim_names):
+                raise ValueError("safety.cap must list every stim channel")
+            if set(self.safety.joint_limits) != joints or set(self.safety.q_plausible) != joints:
+                raise ValueError("safety.joint_limits and safety.q_plausible must list every joint")
+        sc = self.scenario
+        if isinstance(sc, MovementScenario):
+            for key in ("mvc", "mvc_rest"):
+                given = getattr(sc, key)
+                if given is not None and set(given) != set(emg_names):
+                    raise ValueError(f"scenario.{key} must give a value for every EMG channel")
+            if sc.mvc_rest is not None and sc.mvc is None:
+                raise ValueError("scenario.mvc_rest requires scenario.mvc")
         return self
 
 
