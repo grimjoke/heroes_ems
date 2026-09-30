@@ -1,0 +1,8 @@
+# M5 part 2: the key safety scenario across 20 seeds, pure double integration vs damping.
+# Also the no-fault distribution for detector thresholds (D10 rail / dead channel, D11 repeats).
+name: m5_damping_no_intent
+scenario: configs/scenarios/no_intent.yaml
+grid:
+  patient: [configs/patients/healthy.yaml, configs/patients/sci_c5.yaml]
+  controller.joints.r_elbow_flex.damping: [0.0, 10.0]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]

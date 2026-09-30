@@ -151,3 +151,130 @@ def test_fault_paths_bypass_rate_limit(fault):
     assert not out.fired["rate_limit"].any()
     back = sup.step(1.01, np.array([0.5, 0.0]), 1.01, Q, EMG)
     assert back.intensity[0] == pytest.approx(0.05) and back.fired["rate_limit"][0]
+
+
+# ---- D10-D12 detectors -------------------------------------------------------------
+
+
+def detectors(**kw):
+    base = {
+        "max_rise_per_tick": 1.0,
+        "dose_max_mean": 1.0,
+        "emg_rail": 10.0,
+        "emg_rail_min_samples": 10,
+        "emg_dead_ratio": 0.5,
+        "emg_dead_ticks": 10,
+        "angle_max_age_s": 0.05,
+        "angle_repeat_ticks": 10,
+        "impedance_max_ohm": 2000.0,
+    }
+    return config(**{**base, **kw})
+
+
+REST_STD = (0.02, 0.02)
+Z_OK = np.array([1000.0, 1000.0])
+
+
+def live_emg(rng, n=20, std=0.02):
+    return std * rng.standard_normal((n, 2))
+
+
+def tick(sup, i, emg, q=None, stamp=None, z=Z_OK, cmd=(0.3, 0.3)):
+    t = i * 0.01
+    q = np.array([1.0 + 1e-3 * (i % 7)]) if q is None else q  # varying reading
+    return sup.step(
+        t, np.array(cmd), t, q, emg, q_stamp=t - 0.01 if stamp is None else stamp, impedance=z
+    )
+
+
+def test_detectors_quiet_on_healthy_signals():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    for i in range(300):
+        out = tick(sup, i, live_emg(rng))
+        np.testing.assert_allclose(out.intensity, [0.3, 0.3])
+    assert sup.events == []
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_emg_rail_either_sign(sign):
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    emg = live_emg(rng)
+    emg[:12, 1] = sign * 9.9  # 12 samples at >= 0.98 x rail, below the 20 mV plausible limit
+    out = tick(sup, 1, emg)
+    np.testing.assert_array_equal(out.intensity, 0.0)
+    assert out.fired["emg_rail"].all() and not out.fired["sensor_sanity"].any()
+
+
+def test_emg_rail_ignores_brief_spikes():
+    """A few rail samples per chunk (big stim artifacts) are not a stuck lead."""
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    emg = live_emg(rng)
+    emg[:3, 0] = 10.0
+    assert not tick(sup, 1, emg).fired["emg_rail"].any()
+
+
+def test_emg_dead_channel_after_n_quiet_ticks():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    for i in range(9):
+        emg = live_emg(rng)
+        emg[:, 1] = 0.005 * rng.standard_normal(20)  # amplifier noise only: ratio 0.25
+        assert not tick(sup, i, emg).fired["emg_dead"].any()
+    out = tick(sup, 9, emg)
+    np.testing.assert_array_equal(out.intensity, 0.0)
+    assert out.fired["emg_dead"].all()
+    healthy = tick(sup, 10, live_emg(rng))  # signal back -> counter resets
+    assert not healthy.fired["emg_dead"].any()
+
+
+def test_emg_dead_needs_calibrated_rest_std():
+    with pytest.raises(ValueError, match="emg_rest_std"):
+        SafetySupervisor(detectors())
+
+
+def test_angle_stale_message_zeroes_all():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    out = tick(sup, 10, live_emg(rng), stamp=0.10 - 0.06)  # 60 ms old > 50 ms
+    np.testing.assert_array_equal(out.intensity, 0.0)
+    assert out.fired["angle_stale"].all()
+    missing = sup.step(0.2, np.array([0.3, 0.3]), 0.2, np.array([1.0]), live_emg(rng))
+    assert missing.fired["angle_stale"].all()  # configured but no stamp -> stale
+
+
+def test_angle_frozen_after_n_identical_readings():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    q = np.array([1.234])
+    outs = [tick(sup, i, live_emg(rng), q=q) for i in range(12)]
+    assert not outs[9].fired["angle_frozen"].any()  # 9 repeats
+    assert outs[10].fired["angle_frozen"].all()  # 10th repeat trips
+    np.testing.assert_array_equal(outs[10].intensity, 0.0)
+
+
+@pytest.mark.parametrize("z", [np.array([2500.0, 1000.0]), np.array([np.inf, 1000.0])])
+def test_impedance_cuts_only_that_channel(z):
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    out = tick(sup, 1, live_emg(rng), z=z)
+    np.testing.assert_allclose(out.intensity, [0.0, 0.3])
+    assert out.fired["impedance"].tolist() == [True, False]
+
+
+def test_impedance_missing_reading_counts_as_bad():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(), REST_STD)
+    t = 0.01
+    out = sup.step(t, np.array([0.3, 0.3]), t, np.array([1.0]), live_emg(rng), q_stamp=t)
+    np.testing.assert_array_equal(out.intensity, 0.0)
+    assert out.fired["impedance"].all()
+
+
+def test_detector_config_validated():
+    with pytest.raises(ValueError, match="emg_rail"):
+        config(emg_rail_min_samples=5)  # count without a rail
+    with pytest.raises(ValueError):
+        config(emg_dead_ratio=1.5)

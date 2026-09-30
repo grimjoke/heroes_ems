@@ -89,6 +89,28 @@ def step_responses(log: pd.DataFrame, joint: str, cfg: MetricsConfig) -> pd.Data
     return pd.DataFrame(rows, columns=["t_step", "time_to_target", "overshoot"])
 
 
+def limit_excursion(log: pd.DataFrame, joint: str, limits: tuple[float, float]) -> dict:
+    """How far and how long q went beyond the joint limits (safety.joint_limits)."""
+    q, lo, hi = log[f"q_{joint}"].to_numpy(), limits[0], limits[1]
+    beyond = np.maximum(np.maximum(q - hi, lo - q), 0.0)
+    return {
+        "q_max": float(q.max()),
+        "q_min": float(q.min()),
+        "beyond_limit_max": float(beyond.max()),
+        "time_beyond_limit_s": float((beyond > 0).sum() * _dt(log)),
+    }
+
+
+def longest_repeat(x: np.ndarray) -> int:
+    """Longest run of consecutive identical values, counted in repeats (0 = none)."""
+    same = np.r_[False, np.diff(x) == 0]
+    best = cur = 0
+    for s in same:
+        cur = cur + 1 if s else 0
+        best = max(best, cur)
+    return best
+
+
 def safety_event_counts(events: pd.DataFrame) -> dict[str, int]:
     if events.empty:
         return {}
@@ -118,6 +140,9 @@ def summarize(cfg: SimConfig, result: Any, events: pd.DataFrame) -> dict[str, fl
                 )
                 m[f"overshoot_mean_{j}"] = float(steps["overshoot"].mean())
                 m[f"overshoot_max_{j}"] = float(steps["overshoot"].max())
+        for key, v in limit_excursion(log, j, cfg.safety.joint_limits[j]).items():
+            m[f"{key}_{j}"] = v
+        m[f"q_meas_repeat_max_{j}"] = float(longest_repeat(log[f"q_meas_{j}"].to_numpy()))
         if sc.closed_loop:
             if sc.target is None:
                 m[f"ref_max_excursion_{j}"] = max_excursion(log, j, of="ref")

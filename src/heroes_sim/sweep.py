@@ -23,7 +23,7 @@ from typing import Any
 
 import pandas as pd
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from heroes_sim.config import load_run_config
 
@@ -32,12 +32,21 @@ class SweepSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str
-    scenario: Path
-    patient: Path | None = None  # default: the scenario's patient_file
+    scenario: Path | None = None  # or a `scenario` grid key (list of paths)
+    patient: Path | None = None  # default: the scenario's patient_file; or a `patient` grid key
     base: Path = Path("configs/base.yaml")
     overrides: dict[str, Any] = Field(default_factory=dict)  # fixed for every point
     grid: dict[str, list[Any]] = Field(min_length=1)  # dotted key -> values; full product
     seeds: list[int] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _scenario_given(self) -> SweepSpec:
+        if self.scenario is None and "scenario" not in self.grid:
+            raise ValueError("give `scenario`, or `scenario` as a grid key")
+        return self
+
+
+FILE_KEYS = ("scenario", "patient")  # grid keys that pick files instead of dotted overrides
 
 
 def load_spec(path: str | Path) -> SweepSpec:
@@ -64,7 +73,10 @@ def make_sweep(spec: SweepSpec, root: str | Path = "sweeps", force: bool = False
     (out / "slurm").mkdir(exist_ok=True)
     rows = []
     for i, (seed, params) in enumerate(points(spec)):
-        cfg = load_run_config(spec.scenario, spec.base, {**spec.overrides, **params}, spec.patient)
+        scenario = params.get("scenario", spec.scenario)
+        patient = params.get("patient", spec.patient)
+        dotted = {k: v for k, v in params.items() if k not in FILE_KEYS}
+        cfg = load_run_config(scenario, spec.base, {**spec.overrides, **dotted}, patient)
         run = {
             "sweep": spec.name,
             "index": i,

@@ -25,6 +25,9 @@ HOLD = [{"kind": "hold", "duration_s": 1.0}, {"kind": "step", "duration_s": 9.0,
 CASES: dict[str, dict] = {
     "no fault": {},
     "biceps electrode detach": {"faults": [{"kind": "electrode_detach", "channel": "biceps_stim"}]},
+    "biceps electrode 30% contact": {
+        "faults": [{"kind": "electrode_detach", "channel": "biceps_stim", "contact": 0.3}]
+    },
     "triceps electrode detach": {
         "faults": [{"kind": "electrode_detach", "channel": "triceps_stim"}]
     },
@@ -32,7 +35,8 @@ CASES: dict[str, dict] = {
     "triceps EMG dropout": {"faults": [{"kind": "emg_dropout", "channel": "triceps"}]},
     "biceps EMG saturation": {"faults": [{"kind": "emg_saturation", "channel": "biceps"}]},
     "triceps EMG saturation": {"faults": [{"kind": "emg_saturation", "channel": "triceps"}]},
-    "angle sensor freeze": {"faults": [{"kind": "angle_freeze", "joint": "r_elbow_flex"}]},
+    "angle frozen value": {"faults": [{"kind": "angle_freeze", "joint": "r_elbow_flex"}]},
+    "angle driver stale": {"faults": [{"kind": "angle_stale"}]},
     "artifact x5": {"faults": [{"kind": "artifact_increase", "factor": 5.0}]},
     "push +5 N m, 0.5 s": {
         "perturbations": [{"t_end": FAULT_T + 0.5, "torque": {"r_elbow_flex": 5.0}}]

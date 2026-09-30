@@ -45,6 +45,8 @@ from heroes_sim.sensors.emg import EMGSensor
 from heroes_sim.sensors.kinematics import AngleSensor
 from heroes_sim.stim import StimModel
 
+RAIL_FRACTION = 0.98  # a sample within 2% of the amplifier rail counts as "at the rail"
+
 
 def make_rng(seed: int, component: str) -> np.random.Generator:
     """Per-component stream from the run seed. Keyed by name, so adding a component
@@ -119,6 +121,7 @@ class Calibration:
     log: pd.DataFrame
     trials: list[MVCTrialResult]
     mvc: MVCValues  # MVC + rest per EMG channel, deadband per joint
+    emg_rest_std: tuple[float, ...]  # raw-EMG chunk std at rest, per channel (dead-lead ref)
 
 
 @dataclass(frozen=True)
@@ -212,7 +215,10 @@ def calibrate(cfg: SimConfig, seed: int, prefix: str, on_step: StepHook | None) 
         ctrl.deadband_floor,
     )
     values = MVCValues(tuple(mvc), tuple(rest), deadband)
-    return Calibration(log=log, trials=trials, mvc=values)
+    rest_std = tuple(
+        float(log.loc[at_rest, f"emg_std_{ch.name}"].mean()) for ch in cfg.emg.channels
+    )
+    return Calibration(log=log, trials=trials, mvc=values, emg_rest_std=rest_std)
 
 
 def _best_mean(x: np.ndarray, w: int) -> tuple[float, int]:
@@ -387,6 +393,8 @@ class _Episode:
         qd_buf = np.zeros((per_tick, len(joints)))
         u_stim = np.zeros(len(muscles))
         groups = np.empty(log.n, dtype=object)
+        sat = cfg.emg.saturation_mv
+        rail = None if sat is None else RAIL_FRACTION * sat
         k = i = 0
         for _ in range(n_steps):
             if inject.faults or inject.perturbations:
@@ -417,6 +425,9 @@ class _Episode:
 
             emg_chunk = self.emg.chunk(u_buf[:i], qd_buf[:i])
             i = 0
+            log.put(k, "emg_std", emg_names, emg_chunk.std(axis=0))
+            if rail is not None:
+                log.put(k, "emg_rail", emg_names, (np.abs(emg_chunk) >= rail).sum(axis=0))
             if self.closed_loop:
                 out = self.controller.step(now, emg_chunk, self.q_meas)
                 self._queue.append((out.t, out.intensity))

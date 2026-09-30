@@ -105,6 +105,8 @@ def main() -> None:
             "rest": dict(zip(names, mvc.baseline.tolist())),
             "deadband": dict(zip(cfg.plant.joints, mvc.deadband or ())),
         }
+        if result.calibration is not None:
+            summary["emg_rest_std"] = dict(zip(names, result.calibration.emg_rest_std))
         cal = summary["calibrated"]
         print(
             "  MVC envelope (rest): "
