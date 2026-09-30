@@ -1,0 +1,6 @@
+# M5 part 3: 2-minute hold under fatigue (sci_c5), pure double integration vs damping.
+name: m5_damping_fatigue
+scenario: configs/scenarios/fatigue_hold.yaml
+grid:
+  controller.joints.r_elbow_flex.damping: [0.0, 5.0, 10.0]
+seeds: [0, 1, 2, 3, 4]

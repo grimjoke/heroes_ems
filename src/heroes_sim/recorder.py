@@ -1,5 +1,5 @@
 """One run -> log.parquet, events.parquet (safety), meta.json (resolved config, seed, git
-hash, package versions, summary)."""
+hash, package versions, calibration), metrics.json (flat metrics; what sweeps aggregate)."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ def write_run(
     seed: int,
     extra: dict[str, Any] | None = None,
     events: pd.DataFrame | None = None,
+    metrics: dict[str, float] | None = None,
 ) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -52,4 +53,6 @@ def write_run(
         **(extra or {}),
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
+    if metrics is not None:
+        (out / "metrics.json").write_text(json.dumps(metrics, indent=2))
     return out

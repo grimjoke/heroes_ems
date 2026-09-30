@@ -151,3 +151,46 @@ def test_angle_sensor_noise_and_bias(cfg):
     s.reset(np.array([1.0]))
     x = np.array([s.sample()[0] for _ in range(1000)])
     assert 0.001 < x.std() < 0.05 and abs(x.mean() - 1.0) < 0.05
+
+
+def test_emg_channel_faults(cfg):
+    s = sensor(cfg)
+    s.channel_fault = {0: "dropout", 1: "saturation"}
+    emg = s.chunk(np.full((50, 6), 0.5))
+    # dropout: only the amplifier noise floor remains; saturation: stuck at the rail
+    assert emg[:, 0].std() == pytest.approx(cfg.emg.white_noise.std_mv, rel=0.3)
+    assert np.all(emg[:, 1] == cfg.emg.saturation_mv)
+
+
+def test_artifact_increase(cfg):
+    base, big = sensor(cfg, only(cfg, "stim_artifact")), sensor(cfg, only(cfg, "stim_artifact"))
+    big.artifact_gain = 3.0
+    p = pulse([0.2, 0.0], np.zeros(6))
+    base.add_pulse(0, p)
+    big.add_pulse(0, p)
+    np.testing.assert_allclose(big.chunk(np.zeros((40, 6))), 3.0 * base.chunk(np.zeros((40, 6))))
+
+
+def test_angle_sensor_freeze(cfg):
+    s = AngleSensor(cfg.angle_sensor, 1, 0.0005, 0.01, np.random.default_rng(0))
+    s.reset(np.array([1.0]))
+    last = s.sample()
+    s.frozen[0] = True
+    for q in (1.5, 2.0):
+        for _ in range(40):
+            s.push(np.array([q]))
+        assert s.sample()[0] == last[0]
+    s.frozen[0] = False
+    assert s.sample()[0] == pytest.approx(2.0, abs=0.05)
+
+
+def test_angle_sensor_stamps_and_stale(cfg):
+    s = AngleSensor(cfg.angle_sensor, 1, 0.0005, 0.01, np.random.default_rng(0))
+    s.reset(np.array([1.0]))
+    s.sample(0.5)
+    assert s.stamp == pytest.approx(0.5 - cfg.angle_sensor.latency_ms * 1e-3)
+    last = s.sample(0.51)
+    s.stale = True
+    for _ in range(40):
+        s.push(np.array([2.0]))
+    assert s.sample(0.6)[0] == last[0] and s.stamp == pytest.approx(0.51 - 0.01)

@@ -122,6 +122,8 @@ class EMGSensor:
 
     def reset(self) -> None:
         self.source.reset()
+        self.artifact_gain = 1.0  # fault: artifact increase
+        self.channel_fault: dict[int, str] = {}  # fault: channel -> "dropout" | "saturation"
         self._sample = 0
         self._pending = np.zeros((self._pulse_len, self.n_channels))
         self._bw_zi = np.zeros((self._bw_sos.shape[0], 2, self.n_channels))
@@ -135,7 +137,7 @@ class EMGSensor:
             grown[: len(self._pending)] = self._pending
             self._pending = grown
         if self.cfg.stim_artifact.enabled:
-            amp = self.A @ pulse.intensity  # [J]
+            amp = self.artifact_gain * (self.A @ pulse.intensity)  # [J]
             k = self._artifact_kernel
             self._pending[offset : offset + len(k)] += k[:, None] * amp[None, :]
         if self.cfg.m_wave.enabled:
@@ -172,5 +174,10 @@ class EMGSensor:
             emg += np.asarray(qd) @ self.M.T
         if cfg.saturation_mv is not None:
             emg = np.clip(emg, -cfg.saturation_mv, cfg.saturation_mv)
+        for j, mode in self.channel_fault.items():
+            if mode == "dropout":  # lead off: only the amplifier's own noise floor remains
+                emg[:, j] = cfg.white_noise.std_mv * self._rng_noise.standard_normal(n)
+            else:
+                emg[:, j] = cfg.saturation_mv
         self._sample += n
         return emg
