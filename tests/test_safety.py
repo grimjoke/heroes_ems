@@ -226,8 +226,10 @@ def test_emg_dead_channel_after_n_quiet_ticks():
     out = tick(sup, 9, emg)
     np.testing.assert_array_equal(out.intensity, 0.0)
     assert out.fired["emg_dead"].all()
-    healthy = tick(sup, 10, live_emg(rng))  # signal back -> counter resets
-    assert not healthy.fired["emg_dead"].any()
+    # hysteresis: one live-looking tick does not clear it; N consecutive live ticks do
+    outs = [tick(sup, 10 + i, live_emg(rng)) for i in range(10)]
+    assert all(o.fired["emg_dead"].all() for o in outs[:9])
+    assert not outs[9].fired["emg_dead"].any()
 
 
 def test_emg_dead_needs_calibrated_rest_std():

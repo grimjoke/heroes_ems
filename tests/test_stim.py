@@ -103,8 +103,22 @@ def test_no_fatigue_model_keeps_capacity(cfg):
 
 def test_detached_electrode_delivers_nothing(cfg):
     stim = StimModel(cfg.stim, cfg.plant.muscles, 0.0005)
-    stim.channel_gain[0] = 0.0
+    stim.contact[0] = 0.0
     ev = stim.pulse(0.0, np.array([0.8, 0.5]))
     assert ev.intensity[0] == 0.0 and ev.intensity[1] > 0  # no current -> no artifact either
     bic = cfg.plant.muscles.index("BIClong")
     assert ev.muscle_recruitment[bic] == 0.0
+
+
+def test_partial_contact_keeps_current_raises_impedance(cfg):
+    """Current-controlled: same recruitment through a smaller area -> higher impedance and
+    current density (skin-burn risk), which is what D12 monitors."""
+    full = StimModel(cfg.stim, cfg.plant.muscles, 0.0005)
+    part = StimModel(cfg.stim, cfg.plant.muscles, 0.0005)
+    part.contact[0] = 0.25
+    a, b = full.pulse(0.0, np.array([0.6, 0.0])), part.pulse(0.0, np.array([0.6, 0.0]))
+    np.testing.assert_array_equal(a.muscle_recruitment, b.muscle_recruitment)
+    assert part.impedance()[0] == pytest.approx(4 * cfg.stim.impedance_ohm)
+    assert part.current_density(b.intensity)[0] == pytest.approx(4 * b.intensity[0])
+    part.contact[0] = 0.0
+    assert np.isinf(part.impedance()[0])

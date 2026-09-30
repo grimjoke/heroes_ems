@@ -89,6 +89,7 @@ stim:
   recruitment: {threshold: 0.35, slope: 12.0, saturation: 0.9}
   em_delay_ms: 25.0
   combine: probabilistic_sum
+  impedance_ohm: 1000.0       # electrode impedance at full contact, reported per pulse (placeholder)
   fatigue:                    # dC/dt = -f * r * C + k * (1 - C) per muscle; model: none | exponential
     model: exponential
     fatigue_rate_per_s: 0.05  # at full recruitment: capacity halves in ~14 s (r = 0.3: ~46 s)
@@ -125,3 +126,10 @@ safety:
   watchdog_timeout_s: 0.05
   q_plausible: {r_elbow_flex: [-0.3, 2.6]}
   emg_plausible_abs_mv: 20.0
+  # D10-D12 detectors. Thresholds from 395 fault-free M5 sweep runs (see README):
+  emg_rail_min_samples: 10    # of 20 per chunk at |x| >= 0.98 x rail (emg.saturation_mv); 0 seen fault-free
+  emg_dead_ratio: 0.5         # chunk std / calibrated resting std; fault-free never < 0.5 for > 3 ticks
+  emg_dead_ticks: 10
+  angle_max_age_s: 0.05       # primary (D11): message age; sensor latency 10 ms + one 10 ms tick
+  angle_repeat_ticks: 10      # fallback (D11): identical readings; fault-free max 5 over 395 runs
+  impedance_max_ohm: 2000.0   # D12: 2x nominal = contact below 50% (placeholder: electrode/stimulator spec)

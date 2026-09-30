@@ -16,7 +16,7 @@ from pathlib import Path
 
 from heroes_sim import metrics
 from heroes_sim.config import load_run_config
-from heroes_sim.runner import calibrate, run
+from heroes_sim.runner import calibrate, pinned, run
 
 CLEAN = {
     f"emg.{c}.enabled": False for c in ("stim_artifact", "m_wave", "powerline", "baseline_wander")
@@ -51,16 +51,8 @@ def main() -> None:
             cfg = load_run_config(
                 scenarios / f"{name}.yaml", overrides=ov, patient_path=args.patient
             )
-            mvc = calibrate(cfg, args.seed, "calibration/", None).mvc
-            emg = [ch.name for ch in cfg.emg.channels]
-            ov = {
-                **ov,
-                "scenario.calibrated": {
-                    "envelope": dict(zip(emg, mvc.envelope)),
-                    "rest": dict(zip(emg, mvc.baseline.tolist())),
-                    "deadband": dict(zip(cfg.plant.joints, mvc.deadband)),
-                },
-            }
+            cal = calibrate(cfg, args.seed, "calibration/", None)
+            ov = {**ov, "scenario.calibrated": pinned(cfg, cal)}
             cfg = load_run_config(
                 scenarios / f"{name}.yaml", overrides=ov, patient_path=args.patient
             )

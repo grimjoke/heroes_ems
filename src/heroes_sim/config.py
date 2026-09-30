@@ -130,14 +130,20 @@ class _Timed(_Strict):
 
 
 class ElectrodeDetach(_Timed):
-    """Stim channel delivers nothing (gain 0): no recruitment, no artifact."""
+    """Electrode losing skin contact. contact = remaining fraction of the contact area:
+    0 = fully off (no current: no recruitment, no artifact); 0 < contact < 1 = partly off.
+    A current-controlled stimulator still drives the same current through the smaller
+    area, so recruitment is unchanged but impedance and current density rise as 1/contact
+    (skin-burn risk)."""
 
     kind: Literal["electrode_detach"]
     channel: str  # stim channel
+    contact: float = Field(default=0.0, ge=0, lt=1)
 
 
 class EMGDropout(_Timed):
-    """EMG channel reads a flat 0 (lead off)."""
+    """Recording electrode off: the channel reads only the amplifier's own noise floor
+    (emg.white_noise.std_mv), no mains, wander, crosstalk or EMG."""
 
     kind: Literal["emg_dropout"]
     channel: str  # EMG channel
@@ -151,10 +157,16 @@ class EMGSaturation(_Timed):
 
 
 class AngleFreeze(_Timed):
-    """Angle sensor repeats its last reading for this joint."""
+    """Fresh angle messages carry a frozen value (timestamps still advance)."""
 
     kind: Literal["angle_freeze"]
     joint: str
+
+
+class AngleStale(_Timed):
+    """Angle driver stuck: republishes the last message, value and timestamp unchanged."""
+
+    kind: Literal["angle_stale"]
 
 
 class ArtifactIncrease(_Timed):
@@ -165,7 +177,7 @@ class ArtifactIncrease(_Timed):
 
 
 Fault = Annotated[
-    ElectrodeDetach | EMGDropout | EMGSaturation | AngleFreeze | ArtifactIncrease,
+    ElectrodeDetach | EMGDropout | EMGSaturation | AngleFreeze | AngleStale | ArtifactIncrease,
     Field(discriminator="kind"),
 ]
 
@@ -182,6 +194,7 @@ class CalibratedValues(_Strict):
     envelope: dict[str, float]  # EMG channel -> MVC envelope
     rest: dict[str, float]  # EMG channel -> resting envelope
     deadband: dict[str, float]  # joint -> intent deadband
+    emg_rest_std: dict[str, float] | None = None  # EMG channel -> raw chunk std at rest
 
 
 class MovementScenario(_Strict):
@@ -299,6 +312,7 @@ class StimConfig(_Strict):
     em_delay_ms: float = Field(ge=0)
     combine: Literal["probabilistic_sum"]
     fatigue: FatigueConfig
+    impedance_ohm: float = Field(gt=0)  # electrode impedance at full contact (reported per pulse)
     channels: list[StimChannelConfig] = Field(min_length=1)
 
 
@@ -349,6 +363,12 @@ class SafetySection(_Strict):
     watchdog_timeout_s: float = Field(gt=0)
     q_plausible: dict[str, tuple[float, float]]
     emg_plausible_abs_mv: float = Field(gt=0)
+    emg_rail_min_samples: int = Field(ge=0)  # D10: per chunk at either rail; 0 = off
+    emg_dead_ratio: float = Field(ge=0, lt=1)  # D10: chunk std / resting std; 0 = off
+    emg_dead_ticks: int = Field(ge=1)
+    angle_max_age_s: float | None = Field(gt=0)  # D11 primary: message age; None = off
+    angle_repeat_ticks: int = Field(ge=0)  # D11 fallback: identical readings; 0 = off
+    impedance_max_ohm: float | None = Field(gt=0)  # D12: per stim channel; None = off
 
 
 class MVCTrial(_Strict):
@@ -506,6 +526,12 @@ class SimConfig(_Strict):
                 )
             if set(cal.deadband) != joints:
                 raise ValueError("scenario.calibrated.deadband must give every joint")
+            dead_on = self.safety is not None and self.safety.emg_dead_ratio > 0
+            if dead_on and (cal.emg_rest_std is None or set(cal.emg_rest_std) != set(emg_names)):
+                raise ValueError(
+                    "safety.emg_dead_ratio > 0: scenario.calibrated.emg_rest_std must give "
+                    "every EMG channel"
+                )
         return self
 
 

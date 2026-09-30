@@ -157,7 +157,9 @@ def test_emg_channel_faults(cfg):
     s = sensor(cfg)
     s.channel_fault = {0: "dropout", 1: "saturation"}
     emg = s.chunk(np.full((50, 6), 0.5))
-    assert np.all(emg[:, 0] == 0.0) and np.all(emg[:, 1] == cfg.emg.saturation_mv)
+    # dropout: only the amplifier noise floor remains; saturation: stuck at the rail
+    assert emg[:, 0].std() == pytest.approx(cfg.emg.white_noise.std_mv, rel=0.3)
+    assert np.all(emg[:, 1] == cfg.emg.saturation_mv)
 
 
 def test_artifact_increase(cfg):
@@ -180,3 +182,15 @@ def test_angle_sensor_freeze(cfg):
         assert s.sample()[0] == last[0]
     s.frozen[0] = False
     assert s.sample()[0] == pytest.approx(2.0, abs=0.05)
+
+
+def test_angle_sensor_stamps_and_stale(cfg):
+    s = AngleSensor(cfg.angle_sensor, 1, 0.0005, 0.01, np.random.default_rng(0))
+    s.reset(np.array([1.0]))
+    s.sample(0.5)
+    assert s.stamp == pytest.approx(0.5 - cfg.angle_sensor.latency_ms * 1e-3)
+    last = s.sample(0.51)
+    s.stale = True
+    for _ in range(40):
+        s.push(np.array([2.0]))
+    assert s.sample(0.6)[0] == last[0] and s.stamp == pytest.approx(0.51 - 0.01)

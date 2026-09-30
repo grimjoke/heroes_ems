@@ -27,6 +27,7 @@ from heroes_control.normalization import MVCNormalizer
 from heroes_safety import RULES, SafetyConfig, SafetyEvent, SafetySupervisor
 from heroes_sim.config import (
     AngleFreeze,
+    AngleStale,
     ArtifactIncrease,
     ElectrodeDetach,
     EMGDropout,
@@ -104,6 +105,14 @@ def build_safety_config(cfg: SimConfig) -> SafetyConfig:
         q_plausible_min=tuple(s.q_plausible[j][0] for j in joints),
         q_plausible_max=tuple(s.q_plausible[j][1] for j in joints),
         emg_plausible_abs=s.emg_plausible_abs_mv,
+        emg_rail=cfg.emg.saturation_mv,
+        emg_rail_fraction=RAIL_FRACTION,
+        emg_rail_min_samples=s.emg_rail_min_samples,
+        emg_dead_ratio=s.emg_dead_ratio,
+        emg_dead_ticks=s.emg_dead_ticks,
+        angle_max_age_s=s.angle_max_age_s,
+        angle_repeat_ticks=s.angle_repeat_ticks,
+        impedance_max_ohm=s.impedance_max_ohm,
     )
 
 
@@ -156,7 +165,7 @@ def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult
         def intent_at(t: float) -> Intent:
             return Intent(target=traj(t))
 
-    cal, mvc = None, None
+    cal, mvc, rest_std = None, None, None
     if sc.closed_loop:
         if sc.calibrated is not None:
             p = sc.calibrated
@@ -166,10 +175,12 @@ def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult
                 tuple(p.rest[n] for n in names),
                 tuple(p.deadband[j] for j in cfg.plant.joints),
             )
+            if p.emg_rest_std is not None:
+                rest_std = tuple(p.emg_rest_std[n] for n in names)
         else:
             cal = calibrate(cfg, seed, "calibration/", None)
-            mvc = cal.mvc
-    ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=mvc)
+            mvc, rest_std = cal.mvc, cal.emg_rest_std
+    ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=mvc, emg_rest_std=rest_std)
     log = ep.run(sc.duration_s, intent_at, on_step, sc.faults, sc.perturbations)
     baseline = None
     if sc.stim_off_baseline and sc.closed_loop:
@@ -219,6 +230,17 @@ def calibrate(cfg: SimConfig, seed: int, prefix: str, on_step: StepHook | None) 
         float(log.loc[at_rest, f"emg_std_{ch.name}"].mean()) for ch in cfg.emg.channels
     )
     return Calibration(log=log, trials=trials, mvc=values, emg_rest_std=rest_std)
+
+
+def pinned(cfg: SimConfig, cal: Calibration) -> dict:
+    """A calibration as a `scenario.calibrated` override, to reuse it across runs."""
+    names = [ch.name for ch in cfg.emg.channels]
+    return {
+        "envelope": dict(zip(names, cal.mvc.envelope, strict=True)),
+        "rest": dict(zip(names, cal.mvc.baseline.tolist(), strict=True)),
+        "deadband": dict(zip(cfg.plant.joints, cal.mvc.deadband or (), strict=True)),
+        "emg_rest_std": dict(zip(names, cal.emg_rest_std, strict=True)),
+    }
 
 
 def _best_mean(x: np.ndarray, w: int) -> tuple[float, int]:
@@ -280,7 +302,7 @@ class _Injector:
         ep = self.ep
         if isinstance(f, ElectrodeDetach):
             if ep.closed_loop:
-                ep.stim.channel_gain[self._stim.index(f.channel)] = 0.0 if on else 1.0
+                ep.stim.contact[self._stim.index(f.channel)] = f.contact if on else 1.0
         elif isinstance(f, EMGDropout | EMGSaturation):
             j = ep.emg.names.index(f.channel)
             if on:
@@ -289,6 +311,8 @@ class _Injector:
                 ep.emg.channel_fault.pop(j, None)
         elif isinstance(f, AngleFreeze):
             ep.angle.frozen[self._joints.index(f.joint)] = on
+        elif isinstance(f, AngleStale):
+            ep.angle.stale = on
         elif isinstance(f, ArtifactIncrease):
             ep.emg.artifact_gain = f.factor if on else 1.0
 
@@ -317,6 +341,7 @@ class _Episode:
         qd0: np.ndarray,
         lock: bool,
         mvc: MVCValues | None,
+        emg_rest_std: tuple[float, ...] | None = None,
     ):
         self.cfg = cfg
         t = cfg.timing
@@ -350,7 +375,7 @@ class _Episode:
         if self.closed_loop:
             self.controller = ControllerPipeline(self.ctrl_cfg, mvc)
             self.controller.reset(q0)
-            self.supervisor = SafetySupervisor(build_safety_config(cfg))
+            self.supervisor = SafetySupervisor(build_safety_config(cfg), emg_rest_std)
             self.stim = StimModel(cfg.stim, cfg.plant.muscles, dt)
             # Output computed at tick n reaches the supervisor at tick n + latency_ticks.
             # Before the first real output arrives the stimulator sees a zero command.
@@ -417,7 +442,7 @@ class _Episode:
             qd_buf[i - 1] = qd
             self.angle.push(q)
             if ticks.angle_sensor:
-                self.q_meas = self.angle.sample()
+                self.q_meas = self.angle.sample(now)
             if not ticks.controller:
                 if ticks.stim and self.closed_loop:
                     self._pulse(now, applied, offset=i)
@@ -432,7 +457,15 @@ class _Episode:
                 out = self.controller.step(now, emg_chunk, self.q_meas)
                 self._queue.append((out.t, out.intensity))
                 cmd_t, cmd = self._queue.popleft()
-                safe = self.supervisor.step(now, cmd, cmd_t, self.q_meas, emg_chunk)
+                safe = self.supervisor.step(
+                    now,
+                    cmd,
+                    cmd_t,
+                    self.q_meas,
+                    emg_chunk,
+                    q_stamp=self.angle.stamp,
+                    impedance=self.stim.impedance(),
+                )
                 applied = safe.intensity
                 env, norm = out.envelope, out.normalized
                 log.put(k, "intent", joints, out.intent)
@@ -445,6 +478,8 @@ class _Episode:
                 log.put(k, "stim", stim_names, applied)
                 log.put(k, "safety", list(RULES), [f.any() for f in safe.fired.values()])
                 log.put(k, "cap", muscles, self.stim.capacity)
+                log.put(k, "impedance", stim_names, self.stim.impedance())
+                log.put(k, "current_density", stim_names, self.stim.current_density(applied))
             else:
                 env = self.front_end.process(now, emg_chunk)[-1]
             if ticks.stim and self.closed_loop:

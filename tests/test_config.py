@@ -93,3 +93,16 @@ def test_saturation_fault_needs_a_rail():
 def test_fatigue_hold_scenario_loads():
     cfg = load_run_config("configs/scenarios/fatigue_hold.yaml")
     assert cfg.patient.name == "sci_c5" and cfg.scenario.duration_s >= 60
+
+
+def test_pinned_calibration_needs_rest_std_when_dead_detector_on():
+    pinned = {
+        "envelope": {"biceps": 0.5, "triceps": 0.4},
+        "rest": {"biceps": 0.01, "triceps": 0.01},
+        "deadband": {"r_elbow_flex": 0.05},
+    }
+    with pytest.raises(ValidationError, match="emg_rest_std"):
+        load_run_config(SC, overrides={"scenario.calibrated": pinned})
+    load_run_config(
+        SC, overrides={"scenario.calibrated": pinned, "safety.emg_dead_ratio": 0.0}
+    )  # detector off -> not needed

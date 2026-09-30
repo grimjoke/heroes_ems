@@ -104,16 +104,27 @@ class StimModel:
         self._raw = np.zeros(self._m)  # recruited fraction per muscle, before capacity
         self.fatigue.reset()
         self.capacity = np.ones(self._m)
-        self.channel_gain = np.ones(self._k)  # 0 = electrode detached (fault)
+        self.contact = np.ones(self._k)  # electrode contact fraction; 0 = off (fault)
         zero = np.zeros(self._m)
         self._line: deque[np.ndarray] = deque([zero] * (self._delay + 1), maxlen=self._delay + 1)
 
     def pulse(self, t: float, s: np.ndarray) -> PulseEvent:
         """A stimulator pulse at time t with commanded intensity s[K]."""
-        q = quantize(np.asarray(s, dtype=np.float64), self.cfg.n_steps) * self.channel_gain
+        q = quantize(np.asarray(s, dtype=np.float64), self.cfg.n_steps) * (self.contact > 0)
         self._held = recruitment(q, self.cfg.recruitment)
         self._raw = np.clip(self.E @ self._held, 0.0, 1.0)
         return PulseEvent(t, q, self._held.copy(), self._raw * self.capacity)
+
+    def impedance(self) -> np.ndarray:
+        """Per-channel electrode impedance as the stimulator reports it: nominal / contact
+        (inf when fully off)."""
+        with np.errstate(divide="ignore"):
+            return self.cfg.impedance_ohm / self.contact
+
+    def current_density(self, intensity: np.ndarray) -> np.ndarray:
+        """Delivered intensity / contact area, relative to full contact (1 = nominal)."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(self.contact > 0, intensity / self.contact, 0.0)
 
     def step(self) -> np.ndarray:
         """Advance one physics step: fatigue update, then delayed u_stim[M]."""

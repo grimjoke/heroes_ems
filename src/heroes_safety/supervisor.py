@@ -8,7 +8,8 @@ trusted); the rest act per channel.
   emg_rail       an EMG channel has >= `emg_rail_min_samples` samples in the chunk at
                  either amplifier rail (|x| >= rail_fraction * rail): stuck/saturated lead
   emg_dead       an EMG channel's chunk std stays below `emg_dead_ratio` x its calibrated
-                 resting std for `emg_dead_ticks` ticks: detached recording electrode. With
+                 resting std for `emg_dead_ticks` ticks: detached recording electrode
+                 (cleared only after as many consecutive live ticks). With
                  agonist/antagonist differencing, a dead antagonist turns agonist noise into
                  intent, so this matters as much as saturation
   angle_stale    angle message older than `angle_max_age_s` (driver stuck; primary check)
@@ -225,11 +226,18 @@ class SafetySupervisor:
         cfg = self.cfg
         if cfg.emg_dead_ratio <= 0 or len(emg) < 2:
             return False
+        # Hysteresis: declared dead after N consecutive quiet ticks, cleared only after N
+        # consecutive live ticks, so a noisy dead lead can't flicker stim back on.
         quiet = emg.std(axis=0) < cfg.emg_dead_ratio * self._rest_std
         if self._dead_run is None:
             self._dead_run = np.zeros(len(quiet), dtype=int)
+            self._live_run = np.zeros(len(quiet), dtype=int)
+            self._is_dead = np.zeros(len(quiet), dtype=bool)
         self._dead_run = np.where(quiet, self._dead_run + 1, 0)
-        return bool(np.any(self._dead_run >= cfg.emg_dead_ticks))
+        self._live_run = np.where(quiet, 0, self._live_run + 1)
+        self._is_dead |= self._dead_run >= cfg.emg_dead_ticks
+        self._is_dead &= ~(self._live_run >= cfg.emg_dead_ticks)
+        return bool(np.any(self._is_dead))
 
     def _frozen(self, q: np.ndarray) -> bool:
         cfg = self.cfg

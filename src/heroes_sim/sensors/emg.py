@@ -175,6 +175,9 @@ class EMGSensor:
         if cfg.saturation_mv is not None:
             emg = np.clip(emg, -cfg.saturation_mv, cfg.saturation_mv)
         for j, mode in self.channel_fault.items():
-            emg[:, j] = 0.0 if mode == "dropout" else cfg.saturation_mv
+            if mode == "dropout":  # lead off: only the amplifier's own noise floor remains
+                emg[:, j] = cfg.white_noise.std_mv * self._rng_noise.standard_normal(n)
+            else:
+                emg[:, j] = cfg.saturation_mv
         self._sample += n
         return emg

@@ -20,6 +20,7 @@ HEALTHY_MVC = {
         "envelope": {"biceps": 0.5833, "triceps": 0.4640},
         "rest": {"biceps": 0.0180, "triceps": 0.0171},
         "deadband": {"r_elbow_flex": 0.05},
+        "emg_rest_std": {"biceps": 0.0208, "triceps": 0.0201},
     }
 }
 SCI_MVC = {
@@ -27,6 +28,7 @@ SCI_MVC = {
         "envelope": {"biceps": 0.2052, "triceps": 0.0260},
         "rest": {"biceps": 0.0164, "triceps": 0.0136},
         "deadband": {"r_elbow_flex": 0.05},
+        "emg_rest_std": {"biceps": 0.0176, "triceps": 0.0128},
     }
 }
 
@@ -96,7 +98,8 @@ def test_step_targets_closed_loop_tracks(patient, mvc, max_rmse):
     log = res.log
     assert metrics.tracking_rmse(log, J, cfg.metrics) < max_rmse
     assert log["stim_biceps_stim"].max() > 0.05  # stim actually participates
-    assert not any(e.rule in ("watchdog", "sensor_sanity") for e in res.events)
+    faults = ("watchdog", "sensor_sanity", "emg_rail", "emg_dead", "angle_stale", "angle_frozen")
+    assert not any(e.rule in (*faults, "impedance") for e in res.events)  # no false trips
 
 
 def test_damped_reference_helps_impaired_hold():
@@ -176,7 +179,8 @@ def test_faults_and_perturbations_switch_on_and_off():
         log["perturb_" + J].loc[0.61:] == 0
     ).all()
     env = log["env_biceps"]
-    assert env.loc[0.95:0.99].max() < 0.1 * env.loc[0.45:0.5].mean()  # dropout: signal gone
+    # dropout: only the amplifier noise floor remains (~20% of the resting envelope)
+    assert env.loc[0.95:0.99].max() < 0.3 * env.loc[0.45:0.5].mean()
 
 
 def test_perturbation_moves_the_arm():
@@ -208,3 +212,41 @@ def test_summarize_and_metrics_json(tmp_path):
         json.loads((out / "metrics.json").read_text())["final_capacity_min"]
         == m["final_capacity_min"]
     )
+
+
+@pytest.mark.parametrize(
+    "fault,rule",
+    [
+        ({"kind": "emg_saturation", "channel": "triceps"}, "emg_rail"),
+        ({"kind": "emg_dropout", "channel": "triceps"}, "emg_dead"),
+        ({"kind": "angle_stale"}, "angle_stale"),
+        ({"kind": "angle_freeze", "joint": J}, "angle_frozen"),
+        ({"kind": "electrode_detach", "channel": "biceps_stim", "contact": 0.3}, "impedance"),
+    ],
+)
+def test_each_fault_trips_its_rule(fault, rule):
+    """D10-D12: the supervisor now sees each fault class, soon after onset."""
+    ov = {"scenario.duration_s": 3.0, "scenario.faults": [{"t_start": 1.5, **fault}]}
+    res = run(cfg_for("step_targets", SCI, **SCI_MVC, **ov), seed=0)
+    first = min((e.t for e in res.events if e.rule == rule), default=None)
+    assert first is not None and 1.5 <= first < 1.5 + 0.5, (rule, first)
+    assert not any(e.rule == rule and e.t < 1.5 for e in res.events)
+    after = res.log[res.log["t"] > first + 0.02]
+    if rule == "impedance":  # only that channel is cut
+        assert (after["stim_biceps_stim"] == 0).all()
+    else:  # sensor faults: every channel is cut
+        assert (after[["stim_biceps_stim", "stim_triceps_stim"]] == 0).all().all()
+
+
+def test_partial_contact_raises_current_density():
+    faults = [
+        {"kind": "electrode_detach", "channel": "biceps_stim", "contact": 0.3, "t_start": 1.0}
+    ]
+    ov = {"scenario.duration_s": 1.5, "scenario.faults": faults, "safety.impedance_max_ohm": None}
+    log = run(cfg_for("step_targets", SCI, **SCI_MVC, **ov), seed=0).log.set_index("t")
+    assert log.loc[1.05:, "impedance_biceps_stim"].eq(1000.0 / 0.3).all()
+    on = log.loc[1.05:, "stim_biceps_stim"] > 0
+    ratio = (
+        log.loc[1.05:, "current_density_biceps_stim"][on] / log.loc[1.05:, "stim_biceps_stim"][on]
+    )
+    np.testing.assert_allclose(ratio, 1 / 0.3)

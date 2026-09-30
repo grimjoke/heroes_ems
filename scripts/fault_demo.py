@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 from heroes_sim.config import load_run_config
-from heroes_sim.runner import calibrate, run
+from heroes_sim.runner import calibrate, pinned, run
 
 FAULT_T = 4.0
 DURATION = 10.0
@@ -60,19 +60,14 @@ def main() -> None:
         key, _, value = item.partition("=")
         base[key] = yaml.safe_load(value)
     cfg = load_run_config(scenario, overrides=base, patient_path=args.patient)
-    mvc = calibrate(cfg, args.seed, "calibration/", None).mvc
-    emg, j = [ch.name for ch in cfg.emg.channels], cfg.plant.joints[0]
-    base["scenario.calibrated"] = {
-        "envelope": dict(zip(emg, mvc.envelope)),
-        "rest": dict(zip(emg, mvc.baseline.tolist())),
-        "deadband": dict(zip(cfg.plant.joints, mvc.deadband)),
-    }
+    base["scenario.calibrated"] = pinned(cfg, calibrate(cfg, args.seed, "calibration/", None))
+    j = cfg.plant.joints[0]
     lo, hi = cfg.safety.joint_limits[j]
     print(f"{cfg.patient.name} / seed {args.seed}: hold 1.2 rad, fault from t = {FAULT_T} s")
     print(f"joint limits [{lo}, {hi}] rad, stim cap {max(cfg.safety.cap.values())}\n")
     print(
-        f"  {'case':<26} {'q range after':>14} {'ref range':>12} {'max stim b/t':>13} "
-        f"{'dose b/t':>10}  safety rules fired after the fault (ticks)"
+        f"  {'case':<30} {'q range after':>14} {'ref range':>12} {'max stim b/t':>13} "
+        f"{'max J rel':>9}  safety rules fired after the fault (ticks)"
     )
     for label, extra in CASES.items():
         ov = dict(base)
@@ -84,18 +79,18 @@ def main() -> None:
         after = log[log["t"] >= FAULT_T]
         q, ref = after[f"q_{j}"], after[f"ref_{j}"]
         sb, st = after["stim_biceps_stim"], after["stim_triceps_stim"]
-        dt = float(log["t"].iloc[1] - log["t"].iloc[0])
         fired = {
             c.removeprefix("safety_"): int(after[c].sum())
             for c in after.columns
             if c.startswith("safety_") and after[c].any()
         }
+        dens = after[[c for c in after.columns if c.startswith("current_density_")]].max().max()
         print(
-            f"  {label:<26} {q.min():>6.2f}-{q.max():<6.2f} {ref.min():>5.2f}-{ref.max():<5.2f} "
-            f"{sb.max():>6.2f}/{st.max():<5.2f} {sb.sum() * dt:>4.1f}/{st.sum() * dt:<4.1f}  "
-            f"{fired or '-'}"
+            f"  {label:<30} {q.min():>6.2f}-{q.max():<6.2f} {ref.min():>5.2f}-{ref.max():<5.2f} "
+            f"{sb.max():>6.2f}/{st.max():<5.2f} {dens:>9.2f}  {fired or '-'}"
         )
-    print("\nq above the upper limit - margin, or stim at cap while q is pinned there, means the")
+    print("\nmax J rel: peak current density vs full electrode contact (1 = nominal).")
+    print("q above the upper limit - margin, or stim at cap while q is pinned there, means the")
     print("supervisor did not stop a fault from driving the arm into its range limit.")
 
 
