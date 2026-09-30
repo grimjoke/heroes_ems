@@ -1,0 +1,10 @@
+kind: movement
+name: fatigue_hold
+patient_file: ../patients/sci_c5.yaml   # stim does much of the work, so fatigue shows
+duration_s: 120.0
+initial_state: {q: [0.54], qd: [0.0]}
+closed_loop: true
+target:                                  # raise to 90 deg and hold for ~2 minutes
+  - {kind: hold, duration_s: 1.0}
+  - {kind: ramp, duration_s: 2.0, q: [1.5708]}
+  - {kind: hold, duration_s: 117.0}

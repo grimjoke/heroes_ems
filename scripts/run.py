@@ -3,6 +3,7 @@
     uv run python scripts/run.py configs/scenarios/step_targets.yaml --seed 0
     uv run python scripts/run.py configs/scenarios/step_targets.yaml \\
         --patient configs/patients/sci_c5.yaml --override controller.deadband_k=4
+    uv run python scripts/run.py --run-file sweeps/<name>/0003.yaml   # one sweep point
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import pandas as pd
 import yaml
 
 from heroes_sim import metrics
-from heroes_sim.config import MovementScenario, load_run_config
+from heroes_sim.config import load_run_config, load_run_file
 from heroes_sim.recorder import write_run
 from heroes_sim.runner import run
 
@@ -33,7 +34,8 @@ def parse_overrides(items: list[str]) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", type=Path)
+    ap.add_argument("scenario", type=Path, nargs="?")
+    ap.add_argument("--run-file", type=Path, help="sweep run file (instead of a scenario)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--base", type=Path, default=Path("configs/base.yaml"))
     ap.add_argument("--patient", type=Path, help="patient profile (default: the scenario's)")
@@ -42,8 +44,19 @@ def main() -> None:
     ap.add_argument("--viewer", action="store_true", help="opt-in real-time viewer")
     args = ap.parse_args()
 
-    cfg = load_run_config(args.scenario, args.base, parse_overrides(args.override), args.patient)
-    out = args.out or Path("runs") / f"{cfg.scenario.name}_{cfg.patient.name}_s{args.seed}"
+    if (args.scenario is None) == (args.run_file is None):
+        ap.error("give either a scenario or --run-file")
+    params: dict = {}
+    if args.run_file is not None:
+        if args.override or args.patient:
+            ap.error("--run-file is fully resolved; --override/--patient do not apply")
+        cfg, args.seed, params = load_run_file(args.run_file)
+        default_out = args.run_file.parent / "results" / args.run_file.stem
+    else:
+        overrides = parse_overrides(args.override)
+        cfg = load_run_config(args.scenario, args.base, overrides, args.patient)
+        default_out = Path("runs") / f"{cfg.scenario.name}_{cfg.patient.name}_s{args.seed}"
+    out = args.out or default_out
 
     wall0 = time.perf_counter()
     if args.viewer:
@@ -101,37 +114,19 @@ def main() -> None:
             print("  deadband: " + ", ".join(f"{j}={v:.4f}" for j, v in cal["deadband"].items()))
 
     events = pd.DataFrame([asdict(e) for e in result.events], columns=["t", "rule", "channel"])
-    sc = cfg.scenario
-    if isinstance(sc, MovementScenario):
-        m: dict = {}
-        for j in cfg.plant.joints:
-            if sc.target is None:
-                m[f"max_excursion_{j}"] = metrics.max_excursion(log, j)
-                if result.baseline_log is not None:
-                    m[f"stim_off_max_excursion_{j}"] = metrics.max_excursion(result.baseline_log, j)
-                    m[f"controller_excursion_{j}"] = metrics.excursion_vs_baseline(
-                        log, result.baseline_log, j
-                    )
-            else:
-                m[f"tracking_rmse_{j}"] = metrics.tracking_rmse(log, j, cfg.metrics)
-            if sc.closed_loop:
-                if sc.target is None:
-                    m[f"ref_max_excursion_{j}"] = metrics.max_excursion(log, j, of="ref")
-                    m[f"ref_drift_rate_{j}"] = metrics.reference_drift_rate(log, j)
-                else:
-                    m[f"ref_rmse_{j}"] = metrics.tracking_rmse(log, j, cfg.metrics, of="ref")
-        if sc.closed_loop:
-            for ch in cfg.stim.channels:
-                m[f"stim_dose_{ch.name}"] = metrics.stim_dose(log, ch.name)
-                m[f"time_at_cap_{ch.name}"] = metrics.time_at_cap(
-                    log, ch.name, cfg.safety.cap[ch.name]
-                )
-            m["safety_events"] = metrics.safety_event_counts(events)
-        summary["metrics"] = m
-        for key, v in m.items():
-            print(f"  {key}: {v:.4f}" if isinstance(v, float) else f"  {key}: {v}")
+    m = metrics.summarize(cfg, result, events)
+    for key, v in m.items():
+        if not key.startswith(("final_capacity_", "safety_")) or v:
+            print(f"  {key}: {v:.4f}")
+    flat = {"seed": args.seed, **params, **m, "sim_s": sim_s, "wall_s": wall}
     written = write_run(
-        out, log, cfg, args.seed, summary, events if sc.kind == "movement" else None
+        out,
+        log,
+        cfg,
+        args.seed,
+        summary,
+        events if cfg.scenario.kind == "movement" else None,
+        flat if cfg.scenario.kind == "movement" else None,
     )
     print(f"  wrote {written}")
 

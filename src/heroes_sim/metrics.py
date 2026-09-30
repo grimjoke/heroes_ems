@@ -1,11 +1,18 @@
-"""Post-hoc metrics from a controller-rate log (and the safety event table)."""
+"""Post-hoc metrics from a controller-rate log (and the safety event table).
+
+`summarize` returns one flat {name: number} dict per run; it is what run.py prints,
+what goes into metrics.json, and one row of a sweep table.
+"""
 
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from heroes_sim.config import MetricsConfig
+from heroes_safety import RULES
+from heroes_sim.config import MetricsConfig, MovementScenario, SimConfig
 
 
 def _dt(log: pd.DataFrame) -> float:
@@ -61,7 +68,69 @@ def time_at_cap(log: pd.DataFrame, channel: str, cap: float) -> float:
     return float((log[f"stim_{channel}"] >= cap - 1e-12).sum() * _dt(log))
 
 
+def step_responses(log: pd.DataFrame, joint: str, cfg: MetricsConfig) -> pd.DataFrame:
+    """Per target step: time to first come within `tolerance_rad` (NaN if never, before
+    the next step) and overshoot past the target in the step's direction (rad, >= 0)."""
+    t, q, tgt = (log[c].to_numpy() for c in ("t", f"q_{joint}", f"target_{joint}"))
+    jumps = np.nonzero(np.abs(np.diff(tgt)) > cfg.step_jump_rad)[0] + 1
+    ends = [*jumps[1:], len(t)] if len(jumps) else []
+    rows = []
+    for a, b in zip(jumps, ends, strict=True):
+        direction = np.sign(tgt[a] - tgt[a - 1])
+        err = q[a:b] - tgt[a:b]
+        inside = np.nonzero(np.abs(err) < cfg.tolerance_rad)[0]
+        rows.append(
+            {
+                "t_step": t[a],
+                "time_to_target": t[a + inside[0]] - t[a] if len(inside) else np.nan,
+                "overshoot": float(max(0.0, np.max(direction * err))),
+            }
+        )
+    return pd.DataFrame(rows, columns=["t_step", "time_to_target", "overshoot"])
+
+
 def safety_event_counts(events: pd.DataFrame) -> dict[str, int]:
     if events.empty:
         return {}
     return {str(k): int(v) for k, v in events["rule"].value_counts().sort_index().items()}
+
+
+def summarize(cfg: SimConfig, result: Any, events: pd.DataFrame) -> dict[str, float]:
+    """Flat metrics for one run (`result` is a runner.RunResult)."""
+    sc, log = cfg.scenario, result.log
+    m: dict[str, float] = {}
+    if not isinstance(sc, MovementScenario):
+        return m
+    for j in cfg.plant.joints:
+        if sc.target is None:
+            m[f"max_excursion_{j}"] = max_excursion(log, j)
+            if result.baseline_log is not None:
+                m[f"stim_off_max_excursion_{j}"] = max_excursion(result.baseline_log, j)
+                m[f"controller_excursion_{j}"] = excursion_vs_baseline(log, result.baseline_log, j)
+        else:
+            m[f"tracking_rmse_{j}"] = tracking_rmse(log, j, cfg.metrics)
+            steps = step_responses(log, j, cfg.metrics)
+            if len(steps):
+                reached = steps["time_to_target"].notna()
+                m[f"steps_reached_{j}"] = float(reached.mean())
+                m[f"time_to_target_mean_{j}"] = (
+                    float(steps.loc[reached, "time_to_target"].mean()) if reached.any() else np.nan
+                )
+                m[f"overshoot_mean_{j}"] = float(steps["overshoot"].mean())
+                m[f"overshoot_max_{j}"] = float(steps["overshoot"].max())
+        if sc.closed_loop:
+            if sc.target is None:
+                m[f"ref_max_excursion_{j}"] = max_excursion(log, j, of="ref")
+                m[f"ref_drift_rate_{j}"] = reference_drift_rate(log, j)
+            else:
+                m[f"ref_rmse_{j}"] = tracking_rmse(log, j, cfg.metrics, of="ref")
+    if sc.closed_loop:
+        for ch in cfg.stim.channels:
+            m[f"stim_dose_{ch.name}"] = stim_dose(log, ch.name)
+            m[f"time_at_cap_{ch.name}"] = time_at_cap(log, ch.name, cfg.safety.cap[ch.name])
+        caps = {mu: float(log[f"cap_{mu}"].iloc[-1]) for mu in cfg.plant.muscles}
+        m["final_capacity_min"] = min(caps.values())
+        m.update({f"final_capacity_{mu}": v for mu, v in caps.items()})
+        counts = safety_event_counts(events)
+        m.update({f"safety_{r}": float(counts.get(r, 0)) for r in RULES})
+    return m

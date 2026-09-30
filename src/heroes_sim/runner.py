@@ -25,7 +25,18 @@ from heroes_control import (
 )
 from heroes_control.normalization import MVCNormalizer
 from heroes_safety import RULES, SafetyConfig, SafetyEvent, SafetySupervisor
-from heroes_sim.config import MovementScenario, MVCScenario, SimConfig
+from heroes_sim.config import (
+    AngleFreeze,
+    ArtifactIncrease,
+    ElectrodeDetach,
+    EMGDropout,
+    EMGSaturation,
+    Fault,
+    MovementScenario,
+    MVCScenario,
+    Perturbation,
+    SimConfig,
+)
 from heroes_sim.patient import NO_INTENT, Intent, Patient
 from heroes_sim.plant import Plant
 from heroes_sim.scenario import MVCSchedule, TargetTrajectory
@@ -156,12 +167,12 @@ def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult
             cal = calibrate(cfg, seed, "calibration/", None)
             mvc = cal.mvc
     ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=mvc)
-    log = ep.run(sc.duration_s, intent_at, on_step)
+    log = ep.run(sc.duration_s, intent_at, on_step, sc.faults, sc.perturbations)
     baseline = None
     if sc.stim_off_baseline and sc.closed_loop:
         # Same seed and component names -> same patient/sensor noise; only stim differs.
         base_ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=None)
-        baseline = base_ep.run(sc.duration_s, intent_at, None)
+        baseline = base_ep.run(sc.duration_s, intent_at, None, sc.faults, sc.perturbations)
     return RunResult(log=log, mvc=mvc, calibration=cal, events=ep.events, baseline_log=baseline)
 
 
@@ -224,6 +235,56 @@ def _best_window(cfg: SimConfig, log: pd.DataFrame, group: str) -> MVCTrialResul
         activation=act[start : start + w].mean(axis=0),
         torque=tau[start : start + w].mean(axis=0),
     )
+
+
+def _active(item: Fault | Perturbation, t: float) -> bool:
+    return item.t_start <= t and (item.t_end is None or t < item.t_end)
+
+
+class _Injector:
+    """Switches scenario faults and perturbations on and off at their times."""
+
+    def __init__(self, ep: _Episode, faults: list[Fault], perturbations: list[Perturbation]):
+        self.ep, self.faults, self.perturbations = ep, faults, perturbations
+        self.state = [False] * len(faults)
+        cfg = ep.cfg
+        self._stim = [ch.name for ch in cfg.stim.channels]
+        self._joints = cfg.plant.joints
+        self._torques = [
+            np.array([p.torque.get(j, 0.0) for j in self._joints]) for p in perturbations
+        ]
+        self.torque = np.zeros(len(self._joints))
+
+    def update(self, t: float) -> None:
+        for i, f in enumerate(self.faults):
+            on = _active(f, t)
+            if on != self.state[i]:
+                self.state[i] = on
+                self._apply(f, on)
+        if self.perturbations:
+            tau = sum(
+                (tq for p, tq in zip(self.perturbations, self._torques) if _active(p, t)),
+                np.zeros(len(self._joints)),
+            )
+            if not np.array_equal(tau, self.torque):
+                self.torque = tau
+                self.ep.plant.set_external_torque(tau)
+
+    def _apply(self, f: Fault, on: bool) -> None:
+        ep = self.ep
+        if isinstance(f, ElectrodeDetach):
+            if ep.closed_loop:
+                ep.stim.channel_gain[self._stim.index(f.channel)] = 0.0 if on else 1.0
+        elif isinstance(f, EMGDropout | EMGSaturation):
+            j = ep.emg.names.index(f.channel)
+            if on:
+                ep.emg.channel_fault[j] = "dropout" if isinstance(f, EMGDropout) else "saturation"
+            else:
+                ep.emg.channel_fault.pop(j, None)
+        elif isinstance(f, AngleFreeze):
+            ep.angle.frozen[self._joints.index(f.joint)] = on
+        elif isinstance(f, ArtifactIncrease):
+            ep.emg.artifact_gain = f.factor if on else 1.0
 
 
 class _Log:
@@ -302,9 +363,16 @@ class _Episode:
             self.controller.on_stim_pulse(now)
 
     def run(
-        self, duration_s: float, intent_at: Callable[[float], Intent], on_step: StepHook | None
+        self,
+        duration_s: float,
+        intent_at: Callable[[float], Intent],
+        on_step: StepHook | None,
+        faults: list[Fault] | None = None,
+        perturbations: list[Perturbation] | None = None,
     ) -> pd.DataFrame:
         cfg, plant = self.cfg, self.plant
+        inject = _Injector(self, faults or [], perturbations or [])
+        fault_names = [f"{i}_{f.kind}" for i, f in enumerate(inject.faults)]
         t = cfg.timing
         sched = Scheduler(t)
         n_steps = round(duration_s * t.physics_hz)
@@ -321,6 +389,8 @@ class _Episode:
         groups = np.empty(log.n, dtype=object)
         k = i = 0
         for _ in range(n_steps):
+            if inject.faults or inject.perturbations:
+                inject.update(sched.t)
             intent = intent_at(sched.t)
             q, qd = plant.joint_state()
             u_vol = self.patient.step(intent, q, qd)
@@ -363,6 +433,7 @@ class _Episode:
                 log.put(k, "cmd", stim_names, out.intensity)
                 log.put(k, "stim", stim_names, applied)
                 log.put(k, "safety", list(RULES), [f.any() for f in safe.fired.values()])
+                log.put(k, "cap", muscles, self.stim.capacity)
             else:
                 env = self.front_end.process(now, emg_chunk)[-1]
             if ticks.stim and self.closed_loop:
@@ -379,6 +450,10 @@ class _Episode:
             log.put(k, "u_vol", muscles, u_vol)
             log.put(k, "u_stim", muscles, u_stim)
             log.put(k, "act", muscles, plant.muscle_state().activation)
+            if fault_names:
+                log.put(k, "fault", fault_names, inject.state)
+            if inject.perturbations:
+                log.put(k, "perturb", joints, inject.torque)
             groups[k] = intent.mvc_group or ""
             k += 1
 

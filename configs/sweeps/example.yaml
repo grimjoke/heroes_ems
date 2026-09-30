@@ -1,0 +1,15 @@
+# Small smoke-test sweep: 2 gains x 2 EMG noise levels x 2 seeds = 8 short runs.
+# The real M5 sweep (noise x gain, plus damping / allocation offset / blanking window)
+# uses the same format with longer scenarios and more seeds.
+name: example
+scenario: configs/scenarios/step_targets.yaml
+patient: configs/patients/sci_c5.yaml
+overrides:
+  scenario.duration_s: 4.0
+  calibration.rest_s: 1.0
+  calibration.window_s: 0.5
+  calibration.trials: [{group: elbow_flexors, effort_s: 1.0}, {group: elbow_extensors, effort_s: 1.0}]
+grid:
+  controller.joints.r_elbow_flex.gain: [25.0, 50.0]
+  emg.white_noise.std_mv: [0.005, 0.02]
+seeds: [0, 1]

@@ -182,6 +182,10 @@ class Plant:
             self.data.qvel[self._dof_adr].copy(),
         )
 
+    def set_external_torque(self, torque: np.ndarray) -> None:
+        """Passive external torque per joint (N m), held until changed; reset clears it."""
+        self.data.qfrc_applied[self._dof_adr] = torque
+
     def actuator_torque(self) -> np.ndarray:
         """Net muscle torque per joint (N m, + flexion) from the last step."""
         return self.data.qfrc_actuator[self._dof_adr].copy()

@@ -67,3 +67,29 @@ def test_cross_section_names_checked(overrides, match):
         return
     with pytest.raises(ValidationError, match=match):
         load_run_config(SC, overrides=overrides)
+
+
+@pytest.mark.parametrize(
+    "fault,match",
+    [
+        ({"kind": "electrode_detach", "channel": "nope", "t_start": 1.0}, "unknown"),
+        ({"kind": "emg_dropout", "channel": "biceps_stim", "t_start": 1.0}, "unknown"),
+        ({"kind": "angle_freeze", "joint": "knee", "t_start": 1.0}, "unknown"),
+        ({"kind": "artifact_increase", "factor": 5, "t_start": 2.0, "t_end": 1.0}, "t_end"),
+        ({"kind": "artifact_increase", "factor": 0.5, "t_start": 1.0}, "factor"),
+    ],
+)
+def test_faults_validated(fault, match):
+    with pytest.raises(ValidationError, match=match):
+        load_run_config(SC, overrides={"scenario.faults": [fault]})
+
+
+def test_saturation_fault_needs_a_rail():
+    fault = {"kind": "emg_saturation", "channel": "biceps", "t_start": 1.0}
+    with pytest.raises(ValidationError, match="saturation_mv"):
+        load_run_config(SC, overrides={"scenario.faults": [fault], "emg.saturation_mv": None})
+
+
+def test_fatigue_hold_scenario_loads():
+    cfg = load_run_config("configs/scenarios/fatigue_hold.yaml")
+    assert cfg.patient.name == "sci_c5" and cfg.scenario.duration_s >= 60

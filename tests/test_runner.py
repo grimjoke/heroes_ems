@@ -1,5 +1,7 @@
 """Episode-level sanity checks: open loop (M1) and closed loop (M2)."""
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -156,3 +158,53 @@ def test_no_intent_stim_off_baseline():
         res.log["u_vol_BIClong"].to_numpy(), base["u_vol_BIClong"].to_numpy()
     )
     assert metrics.excursion_vs_baseline(res.log, base, J) > 0
+
+
+def test_faults_and_perturbations_switch_on_and_off():
+    """Injected at t_start, removed at t_end, and logged."""
+    faults = [
+        {"kind": "emg_dropout", "channel": "biceps", "t_start": 0.5, "t_end": 1.0},
+        {"kind": "electrode_detach", "channel": "biceps_stim", "t_start": 0.5},
+    ]
+    perturb = [{"t_start": 0.3, "t_end": 0.6, "torque": {J: 5.0}}]
+    ov = {"scenario.duration_s": 1.5, "scenario.faults": faults, "scenario.perturbations": perturb}
+    log = run(cfg_for("step_targets", **HEALTHY_MVC, **ov), seed=0).log.set_index("t")
+    on = log["fault_0_emg_dropout"].astype(bool)
+    assert not on.loc[:0.49].any() and on.loc[0.51:0.99].all() and not on.loc[1.01:].any()
+    assert log["fault_1_electrode_detach"].loc[0.51:].all()
+    assert (log["perturb_" + J].loc[0.31:0.59] == 5.0).all() and (
+        log["perturb_" + J].loc[0.61:] == 0
+    ).all()
+    env = log["env_biceps"]
+    assert env.loc[0.95:0.99].max() < 0.1 * env.loc[0.45:0.5].mean()  # dropout: signal gone
+
+
+def test_perturbation_moves_the_arm():
+    """+torque = flexion while it acts (no_intent, open loop: nothing resists but tone)."""
+    ov = {"scenario.duration_s": 1.0, "scenario.closed_loop": False}
+    push = {"scenario.perturbations": [{"t_start": 0.3, "t_end": 0.8, "torque": {J: 3.0}}]}
+    a = run(cfg_for("no_intent", **ov), seed=0).log.set_index("t")
+    b = run(cfg_for("no_intent", **ov, **push), seed=0).log.set_index("t")
+    assert b.loc[0.79, f"q_{J}"] > a.loc[0.79, f"q_{J}"] + 0.2
+    np.testing.assert_array_equal(a.loc[:0.3, f"q_{J}"], b.loc[:0.3, f"q_{J}"])
+
+
+def test_fatigue_logged_in_closed_loop():
+    log = run(cfg_for("step_targets", SCI, **SCI_MVC, **{"scenario.duration_s": 3.0}), 0).log
+    cap = log["cap_BIClong"].to_numpy()
+    assert cap[0] <= 1.0 and cap[-1] < cap[0] and np.all(np.diff(cap) <= 1e-12 + 1e-4)
+
+
+def test_summarize_and_metrics_json(tmp_path):
+    cfg = cfg_for("step_targets", **HEALTHY_MVC, **{"scenario.duration_s": 5.0})
+    res = run(cfg, seed=0)
+    events = pd.DataFrame([vars(e) for e in res.events], columns=["t", "rule", "channel"])
+    m = metrics.summarize(cfg, res, events)
+    for key in ("tracking_rmse", "steps_reached", "time_to_target_mean", "overshoot_max"):
+        assert f"{key}_{J}" in m
+    assert 0 < m["final_capacity_min"] <= 1 and "safety_watchdog" in m
+    out = write_run(tmp_path, res.log, cfg, 0, metrics=m)
+    assert (
+        json.loads((out / "metrics.json").read_text())["final_capacity_min"]
+        == m["final_capacity_min"]
+    )

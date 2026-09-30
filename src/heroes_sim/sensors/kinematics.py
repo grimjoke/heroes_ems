@@ -31,6 +31,8 @@ class AngleSensor:
         q0 = np.asarray(q0, dtype=np.float64).copy()
         self._line: deque[np.ndarray] = deque([q0] * (self._delay + 1), maxlen=self._delay + 1)
         self._bias = np.zeros(self._n)
+        self.frozen = np.zeros(self._n, dtype=bool)  # fault: repeat the last reading
+        self._out = q0.copy()
 
     def push(self, q_true: np.ndarray) -> None:
         self._line.append(np.asarray(q_true, dtype=np.float64).copy())
@@ -40,4 +42,6 @@ class AngleSensor:
         noise = self.cfg.noise_std_rad * self._rng.standard_normal(self._n)
         q = self._line[0] + self._bias + noise
         res = self.cfg.resolution_rad
-        return np.round(q / res) * res if res > 0 else q
+        q = np.round(q / res) * res if res > 0 else q
+        self._out = np.where(self.frozen, self._out, q)
+        return self._out.copy()

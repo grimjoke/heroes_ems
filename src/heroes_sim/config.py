@@ -118,6 +118,64 @@ class InitialState(_Strict):
     qd: list[float]
 
 
+class _Timed(_Strict):
+    t_start: float = Field(ge=0)
+    t_end: float | None = None  # None -> until the end of the episode
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if self.t_end is not None and self.t_end <= self.t_start:
+            raise ValueError(f"t_end {self.t_end} must be > t_start {self.t_start}")
+        return self
+
+
+class ElectrodeDetach(_Timed):
+    """Stim channel delivers nothing (gain 0): no recruitment, no artifact."""
+
+    kind: Literal["electrode_detach"]
+    channel: str  # stim channel
+
+
+class EMGDropout(_Timed):
+    """EMG channel reads a flat 0 (lead off)."""
+
+    kind: Literal["emg_dropout"]
+    channel: str  # EMG channel
+
+
+class EMGSaturation(_Timed):
+    """EMG channel stuck at the positive amplifier rail (emg.saturation_mv)."""
+
+    kind: Literal["emg_saturation"]
+    channel: str
+
+
+class AngleFreeze(_Timed):
+    """Angle sensor repeats its last reading for this joint."""
+
+    kind: Literal["angle_freeze"]
+    joint: str
+
+
+class ArtifactIncrease(_Timed):
+    """Stim artifact amplitude multiplied (e.g. electrode gel drying)."""
+
+    kind: Literal["artifact_increase"]
+    factor: float = Field(ge=1)
+
+
+Fault = Annotated[
+    ElectrodeDetach | EMGDropout | EMGSaturation | AngleFreeze | ArtifactIncrease,
+    Field(discriminator="kind"),
+]
+
+
+class Perturbation(_Timed):
+    """External torque on joints (N m, + flexion) while active."""
+
+    torque: dict[str, float]
+
+
 class CalibratedValues(_Strict):
     """Pinned calibration results, to skip the MVC trial (e.g. from a previous run's meta)."""
 
@@ -135,6 +193,8 @@ class MovementScenario(_Strict):
     closed_loop: bool  # false: volitional only, no controller or stim
     calibrated: CalibratedValues | None = None  # None -> run the calibration trial first
     stim_off_baseline: bool = False  # also run stim-off (open loop) for baseline metrics
+    faults: list[Fault] = Field(default_factory=list)
+    perturbations: list[Perturbation] = Field(default_factory=list)
 
 
 class EMGChannelConfig(_Strict):
@@ -224,11 +284,21 @@ class StimChannelConfig(_Strict):
     muscles: dict[str, float]  # muscle -> recruitment weight (column of E[M, K]); crosstalk < 1
 
 
+class FatigueConfig(_Strict):
+    """Per-muscle capacity C in [0, 1]: dC/dt = -fatigue_rate * r * C + recovery_rate * (1 - C),
+    r = stim-recruited fraction. model "none" keeps C = 1."""
+
+    model: Literal["none", "exponential"]
+    fatigue_rate_per_s: float = Field(ge=0)  # at full recruitment
+    recovery_rate_per_s: float = Field(ge=0)
+
+
 class StimConfig(_Strict):
     n_steps: int = Field(ge=2)  # digital-pot quantization levels
     recruitment: RecruitmentConfig
     em_delay_ms: float = Field(ge=0)
     combine: Literal["probabilistic_sum"]
+    fatigue: FatigueConfig
     channels: list[StimChannelConfig] = Field(min_length=1)
 
 
@@ -324,6 +394,7 @@ class PassiveDropConfig(_Strict):
 class MetricsConfig(_Strict):
     settle_s: float = Field(ge=0)  # excluded from tracking RMSE after each target step
     step_jump_rad: float = Field(gt=0)  # target change per log sample that counts as a step
+    tolerance_rad: float = Field(gt=0)  # "reached": |q - target| within this after a step
 
 
 class SimConfig(_Strict):
@@ -415,6 +486,18 @@ class SimConfig(_Strict):
             if set(self.safety.joint_limits) != joints or set(self.safety.q_plausible) != joints:
                 raise ValueError("safety.joint_limits and safety.q_plausible must list every joint")
         sc = self.scenario
+        if isinstance(sc, MovementScenario):
+            for f in sc.faults:
+                if isinstance(f, ElectrodeDetach):
+                    need([f.channel], stim_names, "electrode_detach channel")
+                elif isinstance(f, EMGDropout | EMGSaturation):
+                    need([f.channel], emg_names, f"{f.kind} channel")
+                elif isinstance(f, AngleFreeze):
+                    need([f.joint], joints, "angle_freeze joint")
+                if isinstance(f, EMGSaturation) and self.emg.saturation_mv is None:
+                    raise ValueError("emg_saturation fault needs emg.saturation_mv (the rail)")
+            for p in sc.perturbations:
+                need(p.torque, joints, "perturbation torque")
         if isinstance(sc, MovementScenario) and sc.calibrated is not None:
             cal = sc.calibrated
             if set(cal.envelope) != set(emg_names) or set(cal.rest) != set(emg_names):
@@ -444,6 +527,14 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Si
     raw = _read_yaml(path)
     _apply_overrides(raw, overrides)
     return SimConfig.model_validate(raw)
+
+
+def load_run_file(path: str | Path) -> tuple[SimConfig, int, dict[str, Any]]:
+    """A sweep run file: {seed, params, config: <fully resolved SimConfig>, ...}.
+
+    Self-contained, so a run is reproducible even after base.yaml changes."""
+    raw = _read_yaml(path)
+    return SimConfig.model_validate(raw["config"]), int(raw["seed"]), raw.get("params", {})
 
 
 def load_run_config(
