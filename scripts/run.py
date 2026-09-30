@@ -2,7 +2,7 @@
 
     uv run python scripts/run.py configs/scenarios/step_targets.yaml --seed 0
     uv run python scripts/run.py configs/scenarios/step_targets.yaml \\
-        --patient configs/patients/sci_c5.yaml --override controller.deadband=0.1
+        --patient configs/patients/sci_c5.yaml --override controller.deadband_k=4
 """
 
 from __future__ import annotations
@@ -85,15 +85,20 @@ def main() -> None:
             print(f"  MVC {r.group}: torque [{torques}] N m")
     if result.mvc is not None:
         names = [ch.name for ch in cfg.emg.channels]
-        summary["mvc_envelope"] = dict(zip(names, result.mvc.envelope))
-        summary["mvc_rest"] = dict(zip(names, result.mvc.baseline.tolist()))
+        mvc = result.mvc
+        # Same shape as scenario.calibrated, so it can be pasted back to skip calibration.
+        summary["calibrated"] = {
+            "envelope": dict(zip(names, mvc.envelope)),
+            "rest": dict(zip(names, mvc.baseline.tolist())),
+            "deadband": dict(zip(cfg.plant.joints, mvc.deadband or ())),
+        }
+        cal = summary["calibrated"]
         print(
             "  MVC envelope (rest): "
-            + ", ".join(
-                f"{n}={v:.4f} ({summary['mvc_rest'][n]:.4f})"
-                for n, v in summary["mvc_envelope"].items()
-            )
+            + ", ".join(f"{n}={v:.4f} ({cal['rest'][n]:.4f})" for n, v in cal["envelope"].items())
         )
+        if cal["deadband"]:
+            print("  deadband: " + ", ".join(f"{j}={v:.4f}" for j, v in cal["deadband"].items()))
 
     events = pd.DataFrame([asdict(e) for e in result.events], columns=["t", "rule", "channel"])
     sc = cfg.scenario
@@ -102,6 +107,11 @@ def main() -> None:
         for j in cfg.plant.joints:
             if sc.target is None:
                 m[f"max_excursion_{j}"] = metrics.max_excursion(log, j)
+                if result.baseline_log is not None:
+                    m[f"stim_off_max_excursion_{j}"] = metrics.max_excursion(result.baseline_log, j)
+                    m[f"controller_excursion_{j}"] = metrics.excursion_vs_baseline(
+                        log, result.baseline_log, j
+                    )
             else:
                 m[f"tracking_rmse_{j}"] = metrics.tracking_rmse(log, j, cfg.metrics)
             if sc.closed_loop:

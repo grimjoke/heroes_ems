@@ -1,6 +1,7 @@
 """EMG-driven EMS controller. numpy/scipy only; shared by the sim and the hardware node."""
 
 from heroes_control.filters import EMGFrontEnd
+from heroes_control.intent import calibrate_deadband
 from heroes_control.normalization import MVCValues
 from heroes_control.pipeline import (
     ControllerConfig,
@@ -15,5 +16,6 @@ __all__ = [
     "ControllerPipeline",
     "EMGFrontEnd",
     "MVCValues",
+    "calibrate_deadband",
     "default_front_end",
 ]

@@ -2,7 +2,7 @@ timing:
   physics_hz: 2000
   emg_hz: 2000
   controller_hz: 100
-  stim_hz: 25                 # spec says 30, but 2000/30 is not an integer; 25 divides 2000
+  stim_hz: 25                 # event clock: any rate <= physics_hz (pulses snap to the nearest step)
   angle_sensor_hz: 100
 
 plant:
@@ -51,6 +51,31 @@ emg:
   white_noise:
     enabled: true
     std_mv: 0.005
+  stim_artifact:              # electrode proximity: own electrode >> the other one
+    enabled: true
+    amplitude_mv:
+      biceps: {biceps_stim: 8.0, triceps_stim: 1.0}
+      triceps: {biceps_stim: 1.0, triceps_stim: 8.0}
+    decay_ms: 2.0
+  m_wave:
+    enabled: true
+    amplitude_mv: {BIClong: 3.0, BICshort: 3.0, BRA: 2.0, TRIlong: 2.5, TRIlat: 2.5, TRImed: 2.0}
+    latency_ms: 4.0
+    duration_ms: 10.0
+  powerline:
+    enabled: true
+    freq_hz: 50.0
+    amplitude_mv: [0.02, 0.006, 0.003]
+  baseline_wander:
+    enabled: true
+    std_mv: 0.05
+    cutoff_hz: 0.5
+  motion:
+    enabled: false
+    gain_mv_per_rad_s:
+      biceps: {r_elbow_flex: 0.05}
+      triceps: {r_elbow_flex: 0.05}
+  saturation_mv: 10.0
 
 angle_sensor:
   noise_std_rad: 0.003
@@ -72,11 +97,18 @@ controller:
   bandpass_order: 4
   envelope_hz: 4.0
   envelope_order: 2
-  deadband: 0.05
+  blanking_ms: 15.0           # software blanking (EMG amp has none); covers M-wave (4 + 10 ms); sweep at M5
+  blanking_fill: hold         # sample-and-hold; "zero" notches slow offsets and biases the stimulated side
+  blanking_correction: false  # must be true with zero fill, false with hold
+  deadband_floor: 0.05        # calibrated deadband = max(floor, k * sigma of resting intent)
+  deadband_k: 3.0
+  allocation:                 # recruitment-threshold offset; 0 = plain split (sweep at M5)
+    offset: 0.0
+    epsilon: 0.02             # the offset applies only above this PD output
   derivative_tau_s: 0.02
   latency_ticks: 1            # 10 ms compute latency
-  joints:                     # kp >= ~1.2 limit-cycles for sci_c5 (loop delay: pulse hold + EMD)
-    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 10.0, rom: [0.1, 2.1], kp: 0.8, kd: 0.03}
+  joints:                     # damping 0 = pure double integration, as on hardware; kp >= ~1.2 limit-cycles for sci_c5
+    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 0.0, rom: [0.1, 2.1], kp: 0.8, kd: 0.03}
 
 safety:
   cap: {biceps_stim: 0.8, triceps_stim: 0.8}

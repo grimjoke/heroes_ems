@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from heroes_control.allocation import SignedAllocation
+from heroes_control.blanking import FILL_MODES, StimBlanking
 from heroes_control.filters import EMGFrontEnd, Rectify, bandpass, lowpass
 from heroes_control.intent import AgonistAntagonistIntent
 from heroes_control.normalization import MVCNormalizer, MVCValues
@@ -30,9 +31,13 @@ class ControllerConfig:
     bandpass_order: int
     envelope_hz: float
     envelope_order: int
+    blanking_s: float  # stim-artifact blanking window after each pulse; 0 = no blanking stage
+    blanking_fill: str  # "hold" (sample-and-hold) or "zero"
+    blanking_correction: bool  # envelope / kept fraction; required with (and only with) zero
     agonist: tuple[int, ...]  # EMG channel per joint
     antagonist: tuple[int, ...]
-    deadband: float
+    deadband_floor: float  # deadband when calibration gives none; lower bound otherwise
+    deadband_k: float  # calibrated deadband = max(floor, k * sigma of resting intent)
     gain: tuple[float, ...]  # rad/s^2 per unit intent
     damping: tuple[float, ...]  # 1/s
     q_min: tuple[float, ...]
@@ -42,6 +47,8 @@ class ControllerConfig:
     derivative_tau_s: float
     channel_joint: tuple[int, ...]
     channel_sign: tuple[int, ...]
+    allocation_offset: float  # 0 = plain split; > 0 = recruitment-threshold compensation
+    allocation_epsilon: float  # offset applies only above this output
 
     def __post_init__(self) -> None:
         n = len(self.agonist)
@@ -62,8 +69,21 @@ class ControllerConfig:
             raise ValueError(f"bandpass {self.bandpass_hz} must satisfy 0 < lo < hi < fs/2")
         if not 0 < self.envelope_hz < self.emg_fs_hz / 2:
             raise ValueError("envelope_hz must be in (0, fs/2)")
-        if not 0 <= self.deadband < 1:
-            raise ValueError("deadband must be in [0, 1)")
+        if self.blanking_s < 0:
+            raise ValueError("blanking_s must be >= 0")
+        if self.blanking_fill not in FILL_MODES:
+            raise ValueError(f"blanking_fill must be one of {FILL_MODES}")
+        if self.blanking_s > 0 and self.blanking_correction != (self.blanking_fill == "zero"):
+            raise ValueError(
+                "blanking_correction must be on with zero fill (zeros bias the stimulated "
+                "side's envelope down) and off with hold fill (nothing to correct)"
+            )
+        if not 0 <= self.deadband_floor < 1 or self.deadband_k < 0:
+            raise ValueError("deadband_floor must be in [0, 1) and deadband_k >= 0")
+        if not 0 <= self.allocation_offset < 1:
+            raise ValueError("allocation_offset must be in [0, 1)")
+        if self.allocation_offset > 0 and self.allocation_epsilon <= 0:
+            raise ValueError("allocation_offset > 0 needs allocation_epsilon > 0 (gate)")
         if any(a >= b for a, b in zip(self.q_min, self.q_max, strict=True)):
             raise ValueError("q_min must be < q_max")
         nonneg = ("gain", "damping", "kp", "kd")
@@ -80,14 +100,16 @@ class ControllerConfig:
 
 
 def default_front_end(cfg: ControllerConfig) -> EMGFrontEnd:
+    """[blanking] -> bandpass -> rectify -> lowpass envelope -> [blanking correction]."""
     lo, hi = cfg.bandpass_hz
-    return EMGFrontEnd(
-        [
-            bandpass(lo, hi, cfg.bandpass_order, cfg.emg_fs_hz, cfg.n_emg),
-            Rectify(),
-            lowpass(cfg.envelope_hz, cfg.envelope_order, cfg.emg_fs_hz, cfg.n_emg),
-        ]
-    )
+    stages = [
+        bandpass(lo, hi, cfg.bandpass_order, cfg.emg_fs_hz, cfg.n_emg),
+        Rectify(),
+        lowpass(cfg.envelope_hz, cfg.envelope_order, cfg.emg_fs_hz, cfg.n_emg),
+    ]
+    if cfg.blanking_s > 0:
+        stages.insert(0, StimBlanking(cfg.emg_fs_hz, cfg.blanking_s, cfg.n_emg, cfg.blanking_fill))
+    return EMGFrontEnd(stages)
 
 
 @dataclass(frozen=True)
@@ -121,7 +143,10 @@ class ControllerPipeline:
         self.cfg = cfg
         self.front_end = front_end or default_front_end(cfg)
         self.normalizer = normalizer or MVCNormalizer(mvc)
-        self.intent = intent or AgonistAntagonistIntent(cfg.agonist, cfg.antagonist, cfg.deadband)
+        if mvc.deadband is not None and len(mvc.deadband) != cfg.n_joints:
+            raise ValueError(f"MVC deadband has {len(mvc.deadband)} joints, need {cfg.n_joints}")
+        deadband = mvc.deadband if mvc.deadband is not None else cfg.deadband_floor
+        self.intent = intent or AgonistAntagonistIntent(cfg.agonist, cfg.antagonist, deadband)
         self.reference = reference or DoubleIntegratorReference(
             np.array(cfg.gain),
             np.array(cfg.damping),
@@ -130,7 +155,9 @@ class ControllerPipeline:
             cfg.dt,
         )
         self.pd = pd or PD(np.array(cfg.kp), np.array(cfg.kd), cfg.derivative_tau_s, cfg.dt)
-        self.allocator = allocator or SignedAllocation(cfg.channel_joint, cfg.channel_sign)
+        self.allocator = allocator or SignedAllocation(
+            cfg.channel_joint, cfg.channel_sign, cfg.allocation_offset, cfg.allocation_epsilon
+        )
         self.reset(np.zeros(cfg.n_joints))
 
     def reset(self, q0: float | np.ndarray) -> None:
@@ -138,6 +165,12 @@ class ControllerPipeline:
             stage.reset()
         self.reference.reset(np.atleast_1d(np.asarray(q0, dtype=np.float64)))
         self._envelope = np.zeros(self.cfg.n_emg)
+
+    def on_stim_pulse(self, t: float) -> None:
+        """Stimulator sync: forwarded to every front-end stage that listens (`on_pulse`)."""
+        for stage in self.front_end.stages:
+            if hasattr(stage, "on_pulse"):
+                stage.on_pulse(t)
 
     def step(self, t: float, emg_chunk: np.ndarray, q_meas: float | np.ndarray) -> ControllerOutput:
         """One controller tick. `emg_chunk[n, J]` is all raw EMG since the previous tick."""

@@ -132,3 +132,22 @@ def test_config_validated():
         config(cap=(1.5, 0.8))
     with pytest.raises(ValueError):
         config(channel_sign=(1,))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["watchdog", "sensor_sanity"],
+)
+def test_fault_paths_bypass_rate_limit(fault):
+    """D7: faults cut to zero in one tick, regardless of the rate limit; after the fault
+    clears, stim ramps back up from zero at the rate limit (no jump back)."""
+    sup = SafetySupervisor(config(dose_max_mean=1.0))
+    ramp_to(sup, [0.5, 0.0])
+    if fault == "watchdog":
+        out = sup.step(1.0, None, None, Q, EMG)
+    else:
+        out = sup.step(1.0, np.array([0.5, 0.0]), 1.0, np.array([np.nan]), EMG)
+    np.testing.assert_array_equal(out.intensity, 0.0)
+    assert not out.fired["rate_limit"].any()
+    back = sup.step(1.01, np.array([0.5, 0.0]), 1.01, Q, EMG)
+    assert back.intensity[0] == pytest.approx(0.05) and back.fired["rate_limit"][0]

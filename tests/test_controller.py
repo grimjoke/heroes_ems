@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 
 from heroes_control import ControllerConfig, ControllerPipeline, MVCValues, default_front_end
-from heroes_control.intent import AgonistAntagonistIntent
+from heroes_control.allocation import SignedAllocation
+from heroes_control.intent import AgonistAntagonistIntent, calibrate_deadband
 from heroes_control.normalization import MVCNormalizer
 from heroes_control.pd import PD
 from heroes_control.reference import DoubleIntegratorReference
@@ -19,9 +20,13 @@ def config(**kw):
         "bandpass_order": 4,
         "envelope_hz": 4.0,
         "envelope_order": 2,
+        "blanking_s": 0.0,
+        "blanking_fill": "hold",
+        "blanking_correction": False,
         "agonist": (0,),
         "antagonist": (1,),
-        "deadband": 0.05,
+        "deadband_floor": 0.05,
+        "deadband_k": 3.0,
         "gain": (50.0,),
         "damping": (10.0,),
         "q_min": (0.1,),
@@ -31,6 +36,8 @@ def config(**kw):
         "derivative_tau_s": 0.02,
         "channel_joint": (0, 0),
         "channel_sign": (1, -1),
+        "allocation_offset": 0.0,
+        "allocation_epsilon": 0.0,
     }
     return ControllerConfig(**{**base, **kw})
 
@@ -180,10 +187,61 @@ def test_stage_swappable_by_composition():
         {"bandpass_hz": (20.0, 1500.0)},
         {"q_min": (2.5,)},
         {"agonist": (5,)},
-        {"deadband": 1.0},
+        {"deadband_floor": 1.0},
+        {"allocation_offset": 0.3},  # offset without an epsilon gate
+        {"blanking_s": 0.015, "blanking_fill": "zero"},  # zero fill without correction
+        {"blanking_s": 0.015, "blanking_correction": True},  # correction with hold
         {"kd": (-0.1,)},
     ],
 )
 def test_config_validated(kw):
     with pytest.raises(ValueError):
         config(**kw)
+
+
+def test_reference_velocity_persists_without_damping():
+    """Pure double integration (D6): after intent stops, reference velocity persists."""
+    ref = DoubleIntegratorReference(
+        np.array([10.0]), np.array([0.0]), np.array([0.0]), np.array([10.0]), 0.01
+    )
+    ref.reset(np.array([1.0]))
+    for _ in range(10):
+        ref(np.array([1.0]))
+    v0, q0 = ref(np.zeros(1))
+    for _ in range(50):
+        v, q = ref(np.zeros(1))
+    assert v[0] == v0[0] > 0 and q[0] > q0[0] + 0.4  # still moving, no decay
+
+
+def test_allocation_offset_is_gated():
+    """D1: the threshold offset applies only above epsilon; tiny outputs stay at zero."""
+    alloc = SignedAllocation((0, 0), (1, -1), offset=0.35, epsilon=0.02)
+    np.testing.assert_allclose(alloc(np.array([0.01])), [0.0, 0.0])  # below the gate
+    np.testing.assert_allclose(alloc(np.array([0.1])), [0.35 + 0.65 * 0.1, 0.0])
+    np.testing.assert_allclose(alloc(np.array([-0.5])), [0.0, 0.35 + 0.65 * 0.5])
+    np.testing.assert_allclose(alloc(np.array([2.0])), [1.0, 0.0])
+    plain = SignedAllocation((0, 0), (1, -1))
+    np.testing.assert_allclose(plain(np.array([0.01])), [0.01, 0.0])
+
+
+def test_calibrated_deadband():
+    """D5: deadband = max(floor, k * sigma of resting raw intent)."""
+    rng = np.random.default_rng(0)
+    rest = np.stack([0.1 * rng.standard_normal(20000), np.zeros(20000)], axis=1)
+    (db,) = calibrate_deadband(rest, (0,), (1,), k=3.0, floor=0.05)
+    assert db == pytest.approx(0.3, rel=0.03)
+    quiet = rest * 0.01
+    assert calibrate_deadband(quiet, (0,), (1,), k=3.0, floor=0.05) == (0.05,)
+
+
+def test_pipeline_uses_calibrated_deadband():
+    ctrl = ControllerPipeline(config(), MVCValues((0.5, 0.4), (0.0, 0.0), (0.2,)))
+    assert ctrl.intent(np.array([0.15, 0.0]))[0] == 0.0  # inside calibrated 0.2, not floor 0.05
+    with pytest.raises(ValueError, match="joints"):
+        ControllerPipeline(config(), MVCValues((0.5, 0.4), None, (0.2, 0.2)))
+
+
+def test_normalization_clamps_at_zero():
+    """D4: below-rest envelope reads as zero effort, never negative."""
+    norm = MVCNormalizer(MVCValues((0.5,), (0.1,)))
+    assert norm(np.array([0.02]))[0] == 0.0

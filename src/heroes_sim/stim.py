@@ -47,6 +47,12 @@ class PulseEvent:
     t: float
     intensity: np.ndarray  # [K] quantized
     recruitment: np.ndarray  # [K]
+    muscle_recruitment: np.ndarray  # [M] stim-recruited fraction per muscle (drives M-waves)
+
+    @property
+    def active(self) -> bool:
+        """A pulse is delivered only if some channel has nonzero intensity."""
+        return bool(np.any(self.intensity > 0))
 
 
 class StimModel:
@@ -60,6 +66,7 @@ class StimModel:
 
     def reset(self) -> None:
         self._held = np.zeros(self._k)
+        self._muscles = np.zeros(self._m)
         self.capacity = np.ones(self._m)  # fatigue state (M4); 1 = unfatigued
         zero = np.zeros(self._m)
         self._line: deque[np.ndarray] = deque([zero] * (self._delay + 1), maxlen=self._delay + 1)
@@ -68,9 +75,10 @@ class StimModel:
         """A stimulator pulse at time t with commanded intensity s[K]."""
         q = quantize(np.asarray(s, dtype=np.float64), self.cfg.n_steps)
         self._held = recruitment(q, self.cfg.recruitment)
-        return PulseEvent(t, q, self._held.copy())
+        self._muscles = np.clip(self.E @ self._held, 0.0, 1.0) * self.capacity
+        return PulseEvent(t, q, self._held.copy(), self._muscles.copy())
 
     def step(self) -> np.ndarray:
         """Advance one physics step; returns delayed u_stim[M]."""
-        self._line.append(np.clip(self.E @ self._held, 0.0, 1.0) * self.capacity)
+        self._line.append(self._muscles)
         return self._line[0]
