@@ -32,6 +32,24 @@ SCI_MVC = {
     }
 }
 
+# D17 candidate: adaptive mains canceller on (calibrated with it, seed 0).
+CANCELLER = {"freqs_hz": [50.0, 100.0, 150.0], "mu": 0.002, "mu_bias": 0.02}
+SCI_CANCEL_MVC = {
+    "controller.mains_canceller": CANCELLER,
+    "scenario.calibrated": {
+        "envelope": {"biceps": 0.1984, "triceps": 0.0229},
+        "rest": {"biceps": 0.0110, "triceps": 0.0030},
+        "deadband": {"r_elbow_flex": 0.05},
+        "emg_rest_std": {"biceps": 0.0176, "triceps": 0.0123},
+    },
+}
+D17_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="D17 (open): without the mains canceller the D14 stim-on deadband is 0.16 for "
+    "sci_c5 (blanked mains leaks on the near-paralysed triceps), so the patient cannot drive "
+    "the reference and biceps stim never fires",
+)
+
 
 def cfg_for(name, patient=None, **overrides):
     return load_run_config(
@@ -89,10 +107,16 @@ def test_no_intent_closed_loop_is_quiet(patient, mvc):
         assert metrics.time_at_cap(log, ch, 0.8) == 0.0
 
 
-@pytest.mark.parametrize("patient,mvc,max_rmse", [(None, HEALTHY_MVC, 0.15), (SCI, SCI_MVC, 0.6)])
+@pytest.mark.parametrize(
+    "patient,mvc,max_rmse",
+    [
+        (None, HEALTHY_MVC, 0.15),
+        pytest.param(SCI, SCI_MVC, 0.3, marks=D17_XFAIL),
+        (SCI, SCI_CANCEL_MVC, 0.25),
+    ],
+)
 def test_step_targets_closed_loop_tracks(patient, mvc, max_rmse):
-    """Sanity: stable, stim participates, no faults. Pure double integration (D6) tracks
-    sci_c5 poorly at the default gain (RMSE ~0.5 rad); that is a finding, not a bug."""
+    """Sanity: stable, stim participates, no faults."""
     cfg = cfg_for("step_targets", patient, **mvc)
     res = run(cfg, seed=0)
     log = res.log
@@ -102,20 +126,11 @@ def test_step_targets_closed_loop_tracks(patient, mvc, max_rmse):
     assert not any(e.rule in (*faults, "impedance") for e in res.events)  # no false trips
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="D17 (open): the D14 stim-on deadband (0.16 for sci_c5, set by stim leaking into "
-    "the near-paralysed triceps channel) keeps the reference from following the patient",
-)
-def test_damped_reference_helps_impaired_hold():
-    """sci_c5 alone sags below the 1.8 rad target. With reference damping (the D6 candidate
-    fix) stim holds it higher. With pure double integration at the default gain it does
-    not (closed 1.56 vs open 1.61 rad): see README findings."""
-    base = {
-        "scenario.duration_s": 7.0,
-        **SCI_MVC,
-        "controller.joints.r_elbow_flex.damping": 10.0,
-    }
+@pytest.mark.parametrize("mvc", [pytest.param(SCI_MVC, marks=D17_XFAIL), SCI_CANCEL_MVC])
+def test_damped_reference_helps_impaired_hold(mvc):
+    """sci_c5 alone sags below the 1.8 rad target; with damping (D6) closed-loop stim holds
+    it higher. Pure double integration did not (closed 1.56 vs open 1.61 rad)."""
+    base = {"scenario.duration_s": 7.0, **mvc}
     open_log = run(cfg_for("step_targets", SCI, **base, **{"scenario.closed_loop": False}), 0).log
     closed_log = run(cfg_for("step_targets", SCI, **base), 0).log
     hold = slice(6.0, 7.0)
@@ -297,3 +312,16 @@ def test_lead_off_latch_and_operator_reset_in_closed_loop():
     attempts = log["operator_reset_accepted"].dropna()
     assert list(attempts.round(0)) == [0.0, 1.0]  # refused at 1.4 s, accepted at 5.0 s
     assert not log.loc[5.05:, "safety_emg_dead"].astype(bool).any()
+
+
+@pytest.mark.parametrize("patient,mvc", [(None, HEALTHY_MVC), (SCI, SCI_MVC)])
+def test_flexed_hold_stays_inside_joint_limits(patient, mvc):
+    """D18: holding 1.2 rad with no patient effort, stim carries the gravity load. At kp
+    >= 0.4 the inner loop limit-cycles past the joint limit (d18_inner_gain sweep); the
+    interim default must not. It sags instead (no integral term)."""
+    cfg = cfg_for("no_intent_flexed", patient, **mvc, **{"scenario.stim_off_baseline": False})
+    log = run(cfg, seed=0).log
+    lo, hi = cfg.safety.joint_limits[J]
+    q = log[f"q_{J}"]
+    assert lo <= q.min() and q.max() <= hi
+    assert q[log.t > 5].std() < 0.05  # settled, not oscillating

@@ -193,19 +193,20 @@ Every parameter lives in YAML and is validated at load. Names are cross-checked:
 
 ## Current results
 
-Seed 0, default configs (full EMG noise model, 15 ms hold blanking, pure double integration, fatigue on):
+Default configs (damping 10, kp 0.3, 30 Hz stim, 15 ms interp blanking + notch, stim-on deadband, fatigue on), mean over 10 seeds (`configs/sweeps/d18_inner_gain.yaml`). The last column turns on the D17 mains canceller, which is not yet a default.
 
-| | healthy | sci_c5 |
-|---|---|---|
-| step_targets tracking RMSE, closed loop (open loop) | 0.107 (0.097) rad | **0.427** (0.196) rad |
-| step_targets reference-vs-target RMSE | 0.63 rad | 0.48 rad |
-| no_intent reference drift | 0.00 rad | 0.00 rad |
-| no_intent arm excursion, stim on / stim off / caused by controller | 0.03 / 0.04 / 0.02 rad | 0.15 / 0.20 / 0.17 rad |
-| MVC flexion / extension torque at 90° | +51.5 / −36.4 N·m | +16.9 / −3.5 N·m |
-| MVC envelope (rest), biceps / triceps | 0.583 (0.018) / 0.464 (0.017) mV | 0.205 (0.016) / 0.026 (0.014) mV |
-| Calibrated intent deadband (3σ of resting intent) | 0.05 (floor; 3σ = 0.005) | 0.05 (floor; 3σ = 0.043) |
+| | healthy | sci_c5 | sci_c5, mains canceller (D17) |
+|---|---|---|---|
+| step_targets tracking RMSE, closed loop (open loop 0.097 / 0.196) | 0.095 rad | **0.243** rad | 0.189 rad |
+| step_targets reference-vs-target RMSE | 0.52 rad | 0.64 rad | 0.42 rad |
+| Calibrated intent deadband (D14) | 0.05 (floor) | **0.16** | 0.05 (floor) |
+| no_intent arm motion caused by the controller (max) | 0.012 rad | 0.079 rad | 0.070 rad |
+| no_intent reference drift (max) | 0 | 0.051 rad | 0.016 rad |
+| no_intent_flexed: hold at 1.2 rad sags to | 0.65 rad | 0.74 rad | 0.74 rad |
+| Runs past the joint limit, any scenario | 0 | 0 | 0 |
+| Detector false trips (all 360 sweep runs) | 0 | 0 | 0 |
 
-**The closed loop currently makes sci_c5 tracking worse than no stim at all** (finding 6). A 16 s closed-loop episode plus its 12 s calibration runs at about 5× real time on a typical core; on slower cloud containers, about 2×.
+**sci_c5 tracking is still worse than no stim** without the canceller (finding 13), and **no gain holds a flexed arm without either sagging or oscillating** (finding 12). Both are open decisions (D17, D18).
 
 ## What the simulation has shown
 
@@ -249,7 +250,7 @@ The delays add up to 75 ms or more:
 - 25 ms electromechanical delay;
 - muscle activation.
 
-With sci_c5, kp ≥ 1.2 oscillates by itself in `no_intent`. kp 0.8 looked stable on seed 0 but is marginal across seeds (finding 12); the default is now kp 0.6, kd 0.03 (D18).
+With sci_c5, kp ≥ 1.2 oscillates by itself in `no_intent`. kp 0.8 looked stable on seed 0 but is marginal across seeds, and holding a flexed arm on stim alone needs kp ≤ 0.3 (finding 12); the default is now kp 0.3, kd 0.03 (D18).
 
 **5. Stim below the recruitment threshold does nothing (M2).**
 With no integral term (by design) and no allocation offset (D1), small PD outputs stay under the 0.35 recruitment threshold, a dead zone the PD cannot close. The gated offset exists as a config flag (`controller.allocation`), off by default, for the M5 sweep.
@@ -343,7 +344,28 @@ Two mechanisms, isolated on seeds 1 and 11. Artifact and M-wave were ruled out: 
 - **The deadband is too narrow for the weak channel's noise tail.** Resting raw intent reaches 0.07–0.13 at the 99.9th percentile in 14/20 seeds, against a deadband of 0.05. The deadband comes from 3σ over two 1 s rest windows of a 4 Hz envelope, only about 16 independent samples. The sci_c5 triceps normalization span (MVC − rest ≈ 0.012 mV) amplifies noise, and the zero clamp makes it one-sided (extension). **With stim never delivered, 13/20 seeds still drift**, so this is not a stim effect (D14).
 - **Hold-blanking edges.** Each pulse starts a 15 ms hold. The held sample differs from the live signal by the mains (20 µV at 50 Hz; 15 ms is ¾ of a cycle) plus wander, and the step when the hold ends rings through the bandpass as fake EMG. On seed 1 the drift is gone with stim off and shrinks with mains and wander off (D15).
 - Damping bounds how fast a leak turns into drift but does not remove the leak, so D14 and D15 matter whichever reference law is chosen.
-- **Resolved by D14/D15** (finding 12): the reference never reaches the joint limit over 20 seeds; the residual drift is ≤ 0.06 rad.
+- **Resolved by D14/D15:** over 20 seeds the reference drift is at most 0.05 rad (0.016 with the D17 canceller) and never reaches the clamp. The cost moved to the deadband (finding 13).
+
+**12. The inner PD loop cannot hold a flexed arm on stim alone without sagging or oscillating (D18).**
+`configs/sweeps/d6_confirm.yaml` (20 seeds) and `d18_inner_gain.yaml` (10 seeds). Seed-0 `no_intent` at 0.54 rad hid this.
+
+| runs past the joint limit | kp 0.8 | kp 0.6 | kp 0.4 | kp 0.3 |
+|---|---|---|---|---|
+| sci_c5 `no_intent` (0.54 rad) | **12/20** | 0/20 | 0/10 | 0/10 |
+| healthy `no_intent_flexed` (hold 1.2 rad) | – | **10/10** | **5/10** | 0/10, sags to 0.65 rad |
+| sci_c5 `no_intent_flexed` | – | **10/10** | 0/10, sags to 0.76 | 0/10, sags to 0.74 |
+
+- The swing is a limit cycle of the position loop itself: it is identical with the EMG path disconnected (deadband 0.99), and it is the same at 25 and 30 Hz stim. kd 0.1 makes it worse.
+- When the patient intends nothing, stim carries the whole gravity load, which puts the loop on the steep part of the recruitment curve; with the 0.35 threshold dead zone and about 75 ms of delay (finding 4) that acts like a relay. At 0.54 rad the load is smaller, which is why `no_intent` passed.
+- Without an integral term (spec), the gain that is stable everywhere (0.3) leaves a 0.46–0.55 rad sag when holding 1.2 rad unassisted. `step_targets` is barely affected (healthy 0.095 at every kp; sci_c5 0.243 at kp 0.3 vs 0.306 at 0.6), because there the patient's own drive carries the load.
+- The default is now **kp 0.3**, the only value with no joint-limit breach in any scenario. It is an interim safety choice, flagged as D18.
+
+**13. Interpolating across the blank still leaks mains on a weak channel, and the stim-on deadband turns that into lost control (D17).**
+- Interpolating across 15 ms of 50 Hz (¾ of a cycle) leaves a gated residual at 50 ± k·30 Hz. The notch after blanking cannot remove it, and on steady signals the envelope reads about 2.6× the noise floor. Ablations on sci_c5, seed 0: the leak goes with mains off, and is unchanged with the artifact, M-wave, amplifier recovery or motion turned off.
+- On the sci_c5 triceps (MVC span 0.02 mV) the residual reads as 0.17–0.20 normalized intent. D14 measures it during the stim-on rest and sets the **deadband to 0.16 (0.15–0.19 over 20 seeds)**, so the patient's biceps intent rarely clears it. Only half the steps are reached, sci_c5 tracking (0.243–0.306) is worse than open loop (0.196), and at kp 0.3 biceps stim never fires on seed 0.
+- **Candidate fix: an adaptive mains canceller ahead of blanking** (`controller.mains_canceller`). LMS fits 50/100/150 Hz sinusoids on unblanked samples only and is frozen during blanks, so it cannot ring after a pulse the way a notch before blanking would. A bias term tracks wander for the fit only; without it the wander's gradient noise left a p99 tail. A fast-start step size converges in a few mains cycles; without it the first 0.5 s of mains read as intent and moved the reference 0.22 rad.
+- With the canceller: deadband 0.05 on every seed; stim-on p99 intent 0.026–0.033 (was 0.17–0.20); sci_c5 tracking 0.189 rad at kp 0.3, at open-loop level; no_intent reference drift 0.016 rad (was 0.051). The healthy patient is unchanged. 0 false trips over 180 canceller runs.
+- It still needs the stim sync (H10), and the real mains pickup may be much smaller than the 20 µV modelled (measure it with H4).
 
 ## Design decisions
 
@@ -383,8 +405,8 @@ Resolved after M5 (PR #5):
 
 | # | Decision | Evidence | Proposal |
 |---|---|---|---|
-| **D17** | Mains under the blank | Finding 13: interpolating across 15 ms of 50 Hz leaves a residual at 50 ± k·30 Hz that the notch after blanking cannot remove. On the sci_c5 triceps (MVC span 0.02 mV) it reads as 0.17–0.20 intent, so D14 sets the deadband to 0.16–0.20 and the patient can no longer drive the reference (half the steps never reached; the damped-hold test fails, marked `xfail`). | **An adaptive mains canceller ahead of blanking** (`controller.mains_canceller`, off by default): LMS fit of 50/100/150 Hz sinusoids on unblanked samples only, frozen during blanks, so it cannot ring the way a notch before blanking would. It brings the stim-on tail back to the noise floor and the deadband back to 0.05 (finding 13). Alternatives: per-channel deadbands, or measure the real mains pickup first (it may be far below the 20 µV modelled). |
-| **D18** | Inner PD gain | Finding 12: at kp 0.8 the sci_c5 `no_intent` loop limit-cycles on 12/20 seeds (arm swings up to 1.0 rad, past the joint limit). It is marginal even at 25 Hz stim; the D15 changes (30 Hz, 15 ms interp delay) tipped it. | **Changed to kp 0.6** (kd 0.03): 0/20 limit cycles, same tracking. Flagged because it is a gain change on the hardware controller; revert if you disagree. |
+| **D17** | Mains under the blank | Finding 13: the interp residual sets the sci_c5 deadband to 0.16, and the patient loses control of the reference (tracking worse than open loop; two tests are marked `xfail` for it). | **Turn on the adaptive mains canceller** (`controller.mains_canceller: {freqs_hz: [50, 100, 150], mu: 0.002, mu_bias: 0.02}`). It keeps D15 (interp + notch after) and adds a stage before blanking that cannot ring. Implemented and tested, off by default pending sign-off. Alternatives: per-channel deadbands; measure the real mains pickup first. |
+| **D18** | Inner PD gain | Finding 12: kp ≥ 0.4 limit-cycles past the joint limit when stim alone holds a flexed arm; kp 0.3 is stable everywhere but sags 0.5 rad at 1.2 rad. | **Interim default kp 0.3** (from 0.8), chosen for safety and flagged; revert if you disagree. The structural options, all of which need sign-off: gravity-torque feedforward (needs a model of the arm), gain scheduling by angle, or a slow integral term (the spec forbids one). Re-check the bound on hardware: it depends on the real recruitment curve and delay. |
 | **D19** | Calibration gate vs a silent muscle | Finding 13 side effect: with no mains pickup, the sci_c5 triceps resting std (5.2 µV) is below 1.5 × the 5 µV floor, so the D14 quality gate rejects a correctly attached lead on a paralysed muscle. The D16 reset check is relative to the calibrated resting std, not the floor, so it is unaffected once calibration passes. | Gate on the impedance / lead-off signal where the hardware has one (it does not: H7); otherwise lower the gate to just above 1 × floor on channels flagged as paralysed, or skip it for them and rely on the operator. Needs the real noise floor (H4). |
 
 ## Hardware facts

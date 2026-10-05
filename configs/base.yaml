@@ -125,8 +125,8 @@ controller:
     epsilon: 0.02             # the offset applies only above this PD output
   derivative_tau_s: 0.02
   latency_ticks: 1            # 10 ms compute latency
-  joints:                     # D6: damping 10 -> velocity gain G/b = 5 rad/s per intent, tau 100 ms; kp >= ~1.2 limit-cycles for sci_c5
-    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 10.0, rom: [0.1, 2.1], kp: 0.6, kd: 0.03}
+  joints:                     # D6: damping 10 -> G/b = 5 rad/s per intent, tau 100 ms. D18: kp 0.3 interim (>= 0.4 crosses the joint limit holding flexed)
+    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 10.0, rom: [0.1, 2.1], kp: 0.3, kd: 0.03}
 
 safety:
   cap: {biceps_stim: 0.8, triceps_stim: 0.8}
