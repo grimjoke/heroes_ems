@@ -4,8 +4,8 @@
     uv run python scripts/artifact_demo.py --patient configs/patients/healthy.yaml
 
 Runs each scenario with: clean EMG (M2 model), no blanking, zero-fill blanking (with the
-envelope correction it requires), and
-sample-and-hold blanking. Each variant is calibrated first under its own EMG model (the
+envelope correction it requires), sample-and-hold blanking, interpolating blanking (the
+default, D15), and interpolation plus the adaptive mains canceller (D17). Each variant is calibrated first under its own EMG model (the
 clean model has a lower noise floor), as it would be on hardware.
 """
 
@@ -28,7 +28,15 @@ VARIANTS = {
         "controller.blanking_fill": "zero",
         "controller.blanking_correction": True,
     },
-    "hold blanking": {},
+    "hold blanking": {"controller.blanking_fill": "hold"},
+    "interp blanking": {},
+    "interp + mains canceller": {
+        "controller.mains_canceller": {
+            "freqs_hz": [50.0, 100.0, 150.0],
+            "mu": 0.002,
+            "mu_bias": 0.02,
+        }
+    },
 }
 
 
@@ -44,7 +52,7 @@ def main() -> None:
         j = base.plant.joints[0]
         print(f"\n{name} / {base.patient.name} / seed {args.seed}")
         print(
-            f"  {'variant':<24} {'ref drift':>9} {'track RMSE':>10} {'ref RMSE':>9} "
+            f"  {'variant':<26} {'deadband':>8} {'ref drift':>9} {'track RMSE':>10} {'ref RMSE':>9} "
             f"{'dose bic':>8} {'dose tri':>8}  safety events"
         )
         for label, ov in VARIANTS.items():
@@ -70,7 +78,7 @@ def main() -> None:
             for e in res.events:
                 counts[e.rule] = counts.get(e.rule, 0) + 1
             print(
-                f"  {label:<24} {drift:>9} {track:>10} {ref:>9} "
+                f"  {label:<26} {cal.mvc.deadband[0]:>8.3f} {drift:>9} {track:>10} {ref:>9} "
                 f"{doses[0]:>8.2f} {doses[1]:>8.2f}  {counts or ''}"
             )
 

@@ -8,7 +8,7 @@ Read `SIM_SPEC.md` fully before generating code. Follow it over instincts; flag 
 - `uv run ruff check . && uv run ruff format .` — lint/format
 - `uv run python scripts/passive_drop.py [--viewer]` — M0 demo (headless by default)
 - `uv run python scripts/run.py configs/scenarios/<name>.yaml [--patient P] [--seed N] [--override k=v] [--viewer]` — one run -> `runs/`
-- `uv run python scripts/artifact_demo.py [--patient P]` — M3 stim-artifact feedback: blanking off / zero / hold
+- `uv run python scripts/artifact_demo.py [--patient P]` — stim-artifact feedback: blanking off / zero / hold / interp / interp + mains canceller
 - `uv run python scripts/fault_demo.py [--patient P] [--override k=v]` — M4 fault matrix: what the supervisor catches
 - `uv run python scripts/make_sweep.py configs/sweeps/<spec>.yaml` → `scripts/slurm/array.sbatch` or `scripts/run_sweep.py sweeps/<name>` → `scripts/aggregate.py sweeps/<name>`
 - `uv run python scripts/run.py --run-file sweeps/<name>/NNNN.yaml` — rerun one sweep point
@@ -17,15 +17,15 @@ Read `SIM_SPEC.md` fully before generating code. Follow it over instincts; flag 
 
 ## Deviations from spec
 Design decisions D1–D9 are resolved in README "Design decisions" (PR #3). The short version:
-- Stim pulses are an event clock (nearest physics step); only sampled clocks need integer ratios. Physics 2 kHz, EMG 1:1.
-- Reference is pure double integration (`damping: 0`) as on hardware; damping and the allocation threshold offset exist only as M5 sweep options. Don't change these defaults to improve results.
-- MVC normalization subtracts a rest baseline (clamped at 0); the intent deadband is calibrated as max(floor, k·σ_rest).
-- Blanking is a software stage, 15 ms, hold fill. Zero fill requires envelope correction (enforced), and correction overshoots.
+- Stim pulses are an event clock (nearest physics step); only sampled clocks need integer ratios. Physics 2 kHz, EMG 1:1. Stim 30 Hz (D15: off mains/2).
+- Reference damping 10 at gain 50 (D6 resolved: G/b = 5 rad/s per intent, exact exp(−b·dt) discretisation). The hardware still runs pure double integration until changed deliberately. The allocation threshold offset stays an off-by-default sweep option. Don't change these defaults to improve results.
+- MVC normalization subtracts the stim-off rest baseline (clamped at 0). Deadband (D14) = max(0.05, p99 |intent|) over 30 s of stim-on rest; the noise-floor quality gate rejects a calibration, it does not set the deadband.
+- Blanking is a software stage, 15 ms, interp fill (D15; delays EMG 15.5 ms), 50 Hz notch after blanking (never before: it rings). Zero fill requires envelope correction (enforced), and correction overshoots.
 - EMG is modulated by volitional excitation, not activation. Safety rate limit caps rises only; fault paths bypass it.
 - `no_intent` runs a stim-off baseline (same seed) so patient drift isn't counted as controller drift.
 - Fatigue is the exponential model (stim recruitment only); faults/perturbations are scenario lists.
-- Supervisor detectors (D10–D12, resolved): emg_rail (either sign), emg_dead (hysteresis), angle_stale (primary) + angle_frozen (fallback), impedance (per channel). Thresholds come from 395 fault-free sweep runs; re-derive them from a multi-seed sweep (`scripts/analyze_m5_damping.py` statistics) if the EMG or angle model changes, never from one seed.
-- D13 is deferred to the damping decision (D6-revisit); open: D14 deadband calibration, D15 hold-blanking edges, D16 lead-off latch. Don't change controller or supervisor behaviour for these without sign-off.
+- Supervisor detectors (D10–D12, D16 resolved): emg_rail (either sign; rail = supply/2/gain, H1), emg_dead (latched until an operator reset, accepted after emg_dead_reset_s healthy; auto-clear is a config option), angle_stale (primary) + angle_frozen (fallback), impedance (per channel; off by default: the stimulator has no impedance reporting, H7). Thresholds come from 395 fault-free sweep runs; re-derive them from a multi-seed sweep (`scripts/analyze_m5_damping.py` statistics) if the EMG or angle model changes, never from one seed.
+- Open: D17 mains under the blank (adaptive canceller, `controller.mains_canceller`, off by default), D18 inner PD gain (changed 0.8 → 0.6, flagged), D19 calibration gate on a silent muscle. D13 deferred. Don't change controller or supervisor behaviour for these without sign-off.
 - Metrics live in `heroes_sim.metrics.summarize` (one flat dict → metrics.json → sweep table); add new metrics there, not in scripts.
-- Default PD gains (kp 0.8, kd 0.03) sit below the delay-limited stability bound (~1.2 for sci_c5); re-check `no_intent` for both patients after changing loop timing or gains.
+- Default PD gains kp 0.6, kd 0.03: kp 0.8 limit-cycles for sci_c5 `no_intent` on 12/20 seeds (d6_confirm sweep). Re-check `no_intent` for both patients over 10–20 seeds (not seed 0 alone) after changing loop timing, filtering delay or gains.
 - Pinned calibration values in `tests/test_runner.py` must be refreshed (run `mvc_calibration`, copy `meta.json` "calibrated") whenever the EMG model or calibration protocol changes.

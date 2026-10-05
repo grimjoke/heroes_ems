@@ -4,7 +4,7 @@ A fast, headless, deterministic simulation of a person's arm in an **EMS-only el
 
 The exoskeleton has no motors. It reads the patient's muscle signals (surface EMG), works out what they are trying to do, and electrically stimulates their own muscles (EMS) to help. The **controller in this repo is the real one**: `heroes_control` and `heroes_safety` depend only on numpy/scipy, so the future ROS node on the device wraps the same code.
 
-Architecture and requirements: [SIM_SPEC.md](SIM_SPEC.md). Status: **M0–M4 done, M5 underway.** The closed loop has a realistic EMG model, stim-artifact blanking, muscle fatigue, fault injection, cluster sweeps and a safety supervisor that detects every simulated sensor and electrode fault. The M5 damping sweep (395 runs) is done; the noise × gain sweep is next. Open decisions: adopting reference damping on hardware (D6-revisit), intent-gating calibration (D14), hold-blanking edges (D15), lead-off latching (D16).
+Architecture and requirements: [SIM_SPEC.md](SIM_SPEC.md). Status: **M0–M4 done, M5 underway.** The closed loop has a realistic EMG model, stim-artifact blanking, muscle fatigue, fault injection, cluster sweeps and a safety supervisor that detects every simulated sensor and electrode fault. D6 and D14–D16 are resolved and implemented (reference damping, stim-on deadband calibration, interpolating blank with a notch after it, lead-off latch). Open decisions: mains under the blank (D17), the inner PD gain (D18), and the calibration gate on a silent muscle (D19).
 
 ## The loop
 
@@ -18,11 +18,11 @@ Architecture and requirements: [SIM_SPEC.md](SIM_SPEC.md). Status: **M0–M4 don
                                              │                │         u_stim          │
                                              ▼                │              │          ▼
   ┌──────────── heroes_control (real controller) ────┐        │     stim model      angle sensor
-  │ [blanking] → bandpass → rectify → envelope →     │        │     (quantize,      (latency, noise,
+  │ blank → notch → bandpass → rectify → envelope →  │        │     (quantize,      (latency, noise,
   │ MVC norm → intent → reference → PD → allocation  │◄───────┼──── recruitment,     bias, 100 Hz)
   └──────────────────────────┬───────────────────────┘ q_meas │     E matrix,           │
                              ▼                                │     EM delay)           │
-                 heroes_safety supervisor ────────────────────┴──────► 25 Hz pulses     │
+                 heroes_safety supervisor ────────────────────┴──────► 30 Hz pulses     │
                  (always last before stim)                                              │
                              ▲──────────────────────────────────────────────────────────┘
 ```
@@ -181,14 +181,14 @@ Every parameter lives in YAML and is validated at load. Names are cross-checked:
 
 | Section | Holds |
 |---|---|
-| `timing` | Physics 2 kHz, EMG 2 kHz, controller 100 Hz, angle sensor 100 Hz, stim pulses 25 Hz. Sampled clocks must divide the physics rate; stim pulses are events at any rate, fired at the nearest physics step. |
+| `timing` | Physics 2 kHz, EMG 2 kHz, controller 100 Hz, angle sensor 100 Hz, stim pulses 30 Hz. Sampled clocks must divide the physics rate; stim pulses are events at any rate, fired at the nearest physics step. |
 | `plant` | Model path, joints, muscles, muscle groups (signs are checked against the model's moment arms), exo payload. |
-| `calibration` | MVC protocol: lock angle, rest/effort durations, measurement window. |
-| `emg` | Channels and crosstalk matrix `S`, plus every signal and noise component, each with its own `enabled` flag. |
+| `calibration` | MVC protocol (lock angle, rest/effort durations, measurement window), the stim-on rest for the deadband (D14), and the noise-floor quality gate. |
+| `emg` | Channels and crosstalk matrix `S`, every signal and noise component (each with its own `enabled` flag), and the amplifier (supply, gain → rail; overload recovery). |
 | `angle_sensor` | Noise, bias random walk, latency, resolution. |
 | `stim` | Pot steps, recruitment curve, EM delay, combination rule, fatigue model and rates, and per-channel electrode matrix `E`, joint and direction. |
-| `controller` | Filters, blanking, deadband floor and k, allocation offset, latency; per joint: agonist/antagonist, gain, damping, ROM, kp, kd. |
-| `safety` | Caps, rise limit, joint limits and margin, dose window and limit, watchdog timeout, plausible ranges; D10–D12 detector thresholds. |
+| `controller` | Filters, blanking (window, fill), mains notch, optional mains canceller (D17), deadband floor and percentile, allocation offset, latency; per joint: agonist/antagonist, gain, damping, ROM, kp, kd. |
+| `safety` | Caps, rise limit, joint limits and margin, dose window and limit, watchdog timeout, plausible ranges; D10–D12 detector thresholds; lead-off latch and reset (D16). |
 | `metrics` | Settling window and step threshold for tracking RMSE; tolerance for time-to-target. |
 
 ## Current results
@@ -235,7 +235,8 @@ With a 15 ms window at 25 Hz (37.5% of samples blanked), measured on steady EMG:
 
 - Zero fill biases the stimulated side's envelope down and notches the baseline wander into fake EMG.
 - Dividing by the kept fraction overshoots, because the bandpass smears the gaps, so less signal is lost than the fraction blanked. An inflated envelope on the stimulated side is itself positive feedback: zero + correction runs away in `no_intent` even for the healthy patient.
-- Hold keeps the baseline continuous, needs no correction, and stays clean. The software stage is required, because the EMG amplifier has no blanking circuit (D2).
+- Hold keeps the baseline continuous, needs no correction, and stays clean. The software stage is required, because the EMG amplifier has no blanking circuit (D2, H3).
+- **Since D15 the default fill is interpolation**, which also removes the step at the end of the hold (finding 11). It still leaves a mains residual under each blank (finding 13).
 - Under stim with hold blanking, normalized envelopes on seed 0 read *lower* than the same ticks with stim off (sci_c5 triceps 0.000 vs 0.013). **That seed-0 reading was misleading:** across 20 seeds, hold blanking itself leaks on the weak triceps channel (finding 11).
 
 **3. Weak channels need rest-baseline subtraction (M2).**
@@ -248,7 +249,7 @@ The delays add up to 75 ms or more:
 - 25 ms electromechanical delay;
 - muscle activation.
 
-With sci_c5, kp ≥ 1.2 oscillates by itself in `no_intent`. The default is kp 0.8, kd 0.03, which is stable for both patients.
+With sci_c5, kp ≥ 1.2 oscillates by itself in `no_intent`. kp 0.8 looked stable on seed 0 but is marginal across seeds (finding 12); the default is now kp 0.6, kd 0.03 (D18).
 
 **5. Stim below the recruitment threshold does nothing (M2).**
 With no integral term (by design) and no allocation offset (D1), small PD outputs stay under the 0.35 recruitment threshold, a dead zone the PD cannot close. The gated offset exists as a config flag (`controller.allocation`), off by default, for the M5 sweep.
@@ -342,6 +343,7 @@ Two mechanisms, isolated on seeds 1 and 11. Artifact and M-wave were ruled out: 
 - **The deadband is too narrow for the weak channel's noise tail.** Resting raw intent reaches 0.07–0.13 at the 99.9th percentile in 14/20 seeds, against a deadband of 0.05. The deadband comes from 3σ over two 1 s rest windows of a 4 Hz envelope, only about 16 independent samples. The sci_c5 triceps normalization span (MVC − rest ≈ 0.012 mV) amplifies noise, and the zero clamp makes it one-sided (extension). **With stim never delivered, 13/20 seeds still drift**, so this is not a stim effect (D14).
 - **Hold-blanking edges.** Each pulse starts a 15 ms hold. The held sample differs from the live signal by the mains (20 µV at 50 Hz; 15 ms is ¾ of a cycle) plus wander, and the step when the hold ends rings through the bandpass as fake EMG. On seed 1 the drift is gone with stim off and shrinks with mains and wander off (D15).
 - Damping bounds how fast a leak turns into drift but does not remove the leak, so D14 and D15 matter whichever reference law is chosen.
+- **Resolved by D14/D15** (finding 12): the reference never reaches the joint limit over 20 seeds; the residual drift is ≤ 0.06 rad.
 
 ## Design decisions
 
@@ -350,13 +352,13 @@ Resolved in [PR #3](https://github.com/grimjoke/heroes_ems/pull/3).
 | # | Decision | Resolution |
 |---|---|---|
 | D1 | Allocation offset at the recruitment threshold | **Off** by default: an offset makes tiny noisy outputs jump to threshold-level stim. It is a config flag (`controller.allocation.offset`), gated by `epsilon` (enforced), to sweep at M5. |
-| D2 | Artifact blanking | **The EMG amp has no blanking circuit** (to confirm against the datasheet), so the sim applies none in hardware; blanking is a software stage in the controller. Default window **15 ms** (the M-wave ends by 14 ms), to sweep at M5. **Hold** fill. |
-| D3 | Envelope correction for blanking | **None**, because the fill is hold. Zero fill *requires* correction, and correction is only allowed with zero fill (`ControllerConfig` raises otherwise). |
+| D2 | Artifact blanking | **The EMG amp has no blanking circuit** (to confirm against the datasheet), so the sim applies none in hardware; blanking is a software stage in the controller. Default window **15 ms** (the M-wave ends by 14 ms). Fill was **hold**; now **interpolation** (D15). |
+| D3 | Envelope correction for blanking | **None** with hold or interp fill. Zero fill *requires* correction, and correction is only allowed with zero fill (`ControllerConfig` raises otherwise). |
 | D4 | Rest-baseline subtraction | **Yes**, clamped at zero after subtracting. Under stim with hold blanking, the residual floor stays below the calibrated baseline (finding 2). |
-| D5 | Intent deadband | **Calibrated:** `max(floor 0.05, k·σ_rest)` with k = 3, from resting intent in the calibration trial. |
-| D6 | Reference damping | **0 (pure double integration), as on hardware.** Damping is kept as an option and candidate fix for the M5 sweep (finding 6). Velocity is zeroed at the ROM clamp (tested). |
+| D5 | Intent deadband | Was `max(0.05, 3σ_rest)` from 2 s of stim-off rest; **superseded by D14.** |
+| D6 | Reference damping | Was 0 (pure double integration, as on hardware); **revisited after M5: damping 10** (below). Velocity is zeroed at the ROM clamp (tested). |
 | D7 | Rate-limit direction | **Increases only.** Fast shutoff is the safe direction. Watchdog and sensor-sanity paths bypass it entirely (tested). |
-| D8 | Stim pulse rate | **Integer ratios apply to sampled clocks only.** Stim pulses are events at the nearest physics step (jitter ≤ 0.25 ms). Physics stays at 2 kHz with 1:1 EMG. The rate is 25 Hz until set to the stimulator's real rate. |
+| D8 | Stim pulse rate | **Integer ratios apply to sampled clocks only.** Stim pulses are events at the nearest physics step (jitter ≤ 0.25 ms). Physics stays at 2 kHz with 1:1 EMG. The rate is now **30 Hz** (D15); the real rate is the device programme's (H10). |
 | D9 | sci_c5 resting drift | **Plausible** (flexion, asymmetric tone; finding 7). `no_intent` subtracts a stim-off baseline run. |
 
 Resolved after M4 (PR #4):
@@ -368,36 +370,47 @@ Resolved after M4 (PR #4):
 | D12 | Dead or partly detached electrode | **Stimulator impedance reporting** (option A): `impedance` cuts a channel above `impedance_max_ohm`. Partial contact keeps the current but raises impedance and current density as 1/contact, which is a **skin-burn risk**, so this is a safety requirement. If the real stimulator cannot report impedance, that goes on the hardware risk list. The artifact-presence check stays research; the movement-based rule is rejected. |
 | D13 | Joint-limit guard | **Deferred to the damping decision.** Damping 5–10 removes the breaches (finding 10). If a residual problem remains, evaluate **active braking** (stimulate the antagonist near the limit) before velocity-aware cutting, with care: co-contraction, and a wrong-direction pulse if the angle is wrong. |
 
-### Open decisions (M5)
+Resolved after M5 (PR #5):
+
+| # | Decision | Resolution |
+|---|---|---|
+| D6 | Reference damping | **Adopted: damping 10 s⁻¹ at gain 50**, a velocity mapping of G/b = 5 rad/s per unit intent with τ = 100 ms (the low end of 5–10). Discretised exactly (zero-order hold, `a = exp(−b·dt)`), not forward Euler. Confirmed over 20 seeds (finding 12). Damping does not stop a constant leak from ramping the reference; the deadband must. |
+| D14 | Deadband calibration | **`max(0.05, 99th percentile of |intent|)` over 30 s of rest with stim on** at a typical level (0.2 on both channels), arm supported, after a 2 s settle. The stim-off rest stays the D4 baseline. A **noise-floor quality gate** (resting std ≥ 1.5 × the amplifier floor on every channel) rejects a bad calibration; it does not set the deadband. |
+| D15 | Blanking edges | **Interpolate across the blank** (a line between the samples either side; output delayed by window + 1 sample = 15.5 ms), **50 Hz notch after blanking**, **stim at 30 Hz** (off 25 Hz = mains/2, where every blank lands at the same mains phase). A notch before blanking (rings on every artifact) and a one-mains-cycle 20 ms window are rejected. |
+| D16 | Lead-off: hysteresis or latch | **Latch until an operator reset.** The reset is accepted only after every tripped channel has been healthy (no dead run) for `emg_dead_reset_s` (3 s); otherwise it is refused and logged. Auto-clear hysteresis stays a config option (`emg_dead_latch: false`) for sim scenarios. |
+
+### Open decisions
 
 | # | Decision | Evidence | Proposal |
 |---|---|---|---|
-| **D6-revisit** | Adopt reference damping on the hardware controller | Finding 10: damping 5–10 at gain 50 halves sci_c5 tracking error, removes all joint-limit breaches and the fatigue oscillation, and cuts stim fighting a healthy patient by more than half | Change the hardware controller **deliberately** to damping ≈ 5–10 s⁻¹ with gain/damping ≈ 5–10; confirm with the noise × gain sweep before touching the device. The sim default stays 0 until the hardware changes. |
-| **D14** | How to calibrate intent gating | Finding 11: a 3σ deadband from 2 s of rest misses a one-sided noise tail 1.4–2.6× wider on the weak channel | (a) a longer rest recording (≥ 10 s) with a tail percentile (e.g. 99.9th + margin) instead of k·σ; (b) gate each channel against its own noise floor before differencing; (c) both. Sweep at M5. |
-| **D15** | Hold-blanking edges | Finding 11: the hold-end step (mains + wander) leaks on weak channels | (a) a causal 50 Hz notch before blanking, so the held value tracks the live signal; (b) a window of one mains period (20 ms); (c) interpolation with a one-window delay. Sweep with the blanking window (D2). |
-| **D16** | Lead-off: hysteresis or latch | `emg_dead` now clears after 10 live ticks | A clinical choice: latching until operator reset is more conservative; hysteresis allows recovery from a transient lead lift. |
+| **D17** | Mains under the blank | Finding 13: interpolating across 15 ms of 50 Hz leaves a residual at 50 ± k·30 Hz that the notch after blanking cannot remove. On the sci_c5 triceps (MVC span 0.02 mV) it reads as 0.17–0.20 intent, so D14 sets the deadband to 0.16–0.20 and the patient can no longer drive the reference (half the steps never reached; the damped-hold test fails, marked `xfail`). | **An adaptive mains canceller ahead of blanking** (`controller.mains_canceller`, off by default): LMS fit of 50/100/150 Hz sinusoids on unblanked samples only, frozen during blanks, so it cannot ring the way a notch before blanking would. It brings the stim-on tail back to the noise floor and the deadband back to 0.05 (finding 13). Alternatives: per-channel deadbands, or measure the real mains pickup first (it may be far below the 20 µV modelled). |
+| **D18** | Inner PD gain | Finding 12: at kp 0.8 the sci_c5 `no_intent` loop limit-cycles on 12/20 seeds (arm swings up to 1.0 rad, past the joint limit). It is marginal even at 25 Hz stim; the D15 changes (30 Hz, 15 ms interp delay) tipped it. | **Changed to kp 0.6** (kd 0.03): 0/20 limit cycles, same tracking. Flagged because it is a gain change on the hardware controller; revert if you disagree. |
+| **D19** | Calibration gate vs a silent muscle | Finding 13 side effect: with no mains pickup, the sci_c5 triceps resting std (5.2 µV) is below 1.5 × the 5 µV floor, so the D14 quality gate rejects a correctly attached lead on a paralysed muscle. The D16 reset check is relative to the calibrated resting std, not the floor, so it is unaffected once calibration passes. | Gate on the impedance / lead-off signal where the hardware has one (it does not: H7); otherwise lower the gate to just above 1 × floor on channels flagged as paralysed, or skip it for them and rely on the operator. Needs the real noise floor (H4). |
 
-## Hardware facts needed
+## Hardware facts
 
-Datasheet lookups, to do in one pass once the part numbers are known. Each replaces a placeholder config value:
+Answers to the H1–H11 list, as supplied. Each sets a config value or a risk.
 
-| # | Fact | Source | Config key (placeholder) | Depends on it |
-|---|---|---|---|---|
-| H1 | EMG amplifier rail (± mV at the input, after gain) | EMG amp: input range, gain | `emg.saturation_mv` (10) | D10 rail threshold |
-| H2 | EMG amp recovery after saturation | EMG amp: overload recovery | not modelled | Whether D10 needs a hold-off after a trip |
-| H3 | Does the EMG amp blank in hardware? | EMG amp | assumed no (D2) | Blanking stays in software |
-| H4 | EMG amp input-referred noise (µV RMS in band) | EMG amp | `emg.white_noise.std_mv` (5 µV) | D10 dead-channel ratio |
-| H5 | IMU noise, resolution, output rate, internal filtering (or one still-arm recording) | IMU | `angle_sensor.*` | D11 repeat count |
-| H6 | IMU driver: per-message timestamp or sequence number | driver / ROS message type | assumed stamped | D11 staleness (primary) |
-| H7 | Stimulator: per-channel impedance or lead-off reporting | stimulator | assumed yes (`stim.impedance_ohm` 1000) | D12 |
-| H8 | Stimulator: current- or voltage-controlled; compliance voltage | stimulator | assumed current-controlled | Partial-contact model |
-| H9 | Electrode size; current-density and impedance limits (IEC 60601-2-10) | electrode, standard | `safety.impedance_max_ohm` (2000 = 2× nominal) | D12 threshold |
-| H10 | Stimulator pulse rate | stimulator config | `timing.stim_hz` (25) | Blanking cost, loop delay |
-| H11 | Hardware controller gain | device config | `controller.joints.*.gain` (50) | Every closed-loop result |
+| # | Fact | Answer | In the sim |
+|---|---|---|---|
+| H1 | EMG amp rail | rail = supply / 2 / gain; RAW gain ~200 → ±12.5 mV at 5 V, ±8.25 mV at 3.3 V | `emg.amplifier` {`supply_v` 3.3, `raw_gain` 200} → `saturation_mv` derived; both rails tested. **Confirm the supply voltage.** |
+| H2 | Overload recovery | Not specified; **every stim pulse saturates this amp**. To measure (notes, step 2). | Modelled: `overload_recovery_ms` 5, exponential return after leaving the rail. |
+| H3 | Hardware blanking | None | Software blanking stage (D2, D15) |
+| H4 | Noise floor | Not specified; measure 60 s at rest | `emg.white_noise.std_mv` stays 5 µV |
+| H5 | IMU | Unknown; model or a 60 s still recording to come | `angle_sensor.*` unchanged |
+| H6 | IMU stamps | Check the ROS message header stamp / seq | Assumed stamped (D11 primary) |
+| H7 | Stimulator impedance reporting | **None** (consumer unit) | `safety.impedance_max_ohm: null`; D12 has no data source (notes, item 3) |
+| H8 | Current or voltage control | 200 mA into 500 Ω, probably current-controlled; the series resistor may change what the patient gets (notes, item 1) | Current-controlled |
+| H9 | Electrodes, limits | Sanitas ~45 × 45 mm (~20 cm²); IEC 60601-2-10 attention above 2 mA rms/cm². 200 mA, 450 µs, 25 Hz ≈ 30 mA rms = 1.5 mA/cm² full pad, **3 mA/cm² with half the pad lifted** | Current density logged per channel |
+| H10 | Pulse rate | Set by the device programme (1–150 Hz), **not by the controller** (notes, item 4) | `timing.stim_hz` 30 (D15) |
+| H11 | Controller gain | 50, to confirm in the ROS node config | `gain` 50 |
 
 **Hardware risk list:**
-- **Electrode impedance monitoring (H7).** Without it, a partly detached electrode concentrates the same current in a smaller area. That is a skin-burn risk, and no software check can see it directly.
-- **Pure double integration (D6)** overshoots the joint limit on a routine step task and oscillates under fatigue in simulation.
+- **No impedance or lead-off reporting (H7).** A partly lifted pad keeps the same current over less area: at half contact the H9 example is 3 mA/cm², above the 2 mA/cm² attention level. Nothing in software can see it (tested: `test_partial_contact_undetected_without_impedance_reporting`). Needs a hardware or procedural mitigation.
+- **The controller cannot time the pulses (H10).** The sim's blanking (and the D17 canceller's freeze) assume a stimulator sync signal, as the spec does. With the device running its own programme, blanking needs either a sync output tapped from the stimulator or artifact detection on the EMG (threshold on the rail, H2). Until then, D15 results are an upper bound on what the hardware can do.
+- **Every pulse saturates the EMG amp (H2).** The sim's 8 mV artifact sits just under the 8.25 mV rail; real artifacts are larger. Recovery time decides whether 15 ms of blanking is enough; measure it.
+- **The series resistor (H8)** may change the delivered current; measure what reaches the pads.
+- **Pure double integration (D6)** is what the hardware runs today; the sim now uses damping 10. Change the hardware deliberately.
 
 ## Deviations from the spec
 
