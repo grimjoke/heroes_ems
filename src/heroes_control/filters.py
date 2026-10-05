@@ -43,6 +43,13 @@ def bandpass(lo_hz: float, hi_hz: float, order: int, fs_hz: float, n_channels: i
     return CausalSOS(sos, n_channels)
 
 
+def notch(freq_hz: float, q: float, fs_hz: float, n_channels: int) -> CausalSOS:
+    """Causal IIR notch (mains). Runs after blanking: before it, each artifact spike would
+    make it ring for tens of ms, smearing the artifact outside the blank."""
+    b, a = signal.iirnotch(freq_hz, q, fs=fs_hz)
+    return CausalSOS(signal.tf2sos(b, a), n_channels)
+
+
 def lowpass(cutoff_hz: float, order: int, fs_hz: float, n_channels: int) -> CausalSOS:
     sos = signal.butter(order, cutoff_hz, btype="lowpass", fs=fs_hz, output="sos")
     return CausalSOS(sos, n_channels)

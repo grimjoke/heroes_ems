@@ -11,8 +11,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from heroes_control.allocation import SignedAllocation
-from heroes_control.blanking import FILL_MODES, StimBlanking
-from heroes_control.filters import EMGFrontEnd, Rectify, bandpass, lowpass
+from heroes_control.blanking import FILL_MODES, BlankingCorrection, MainsCanceller, StimBlanking
+from heroes_control.filters import EMGFrontEnd, Rectify, bandpass, lowpass, notch
 from heroes_control.intent import AgonistAntagonistIntent
 from heroes_control.normalization import MVCNormalizer, MVCValues
 from heroes_control.pd import PD
@@ -32,12 +32,17 @@ class ControllerConfig:
     envelope_hz: float
     envelope_order: int
     blanking_s: float  # stim-artifact blanking window after each pulse; 0 = no blanking stage
-    blanking_fill: str  # "hold" (sample-and-hold) or "zero"
+    blanking_fill: str  # "interp", "hold" (sample-and-hold) or "zero"
     blanking_correction: bool  # envelope / kept fraction; required with (and only with) zero
+    notch_hz: tuple[float, ...]  # mains notch(es) after blanking; () = none
+    notch_q: float
+    mains_cancel_hz: tuple[float, ...]  # D17: adaptive canceller before blanking; () = off
+    mains_cancel_mu: float  # LMS step for the sinusoids (time constant ~2 / mu samples)
+    mains_cancel_mu_bias: float  # LMS step for the wander-tracking bias
     agonist: tuple[int, ...]  # EMG channel per joint
     antagonist: tuple[int, ...]
     deadband_floor: float  # deadband when calibration gives none; lower bound otherwise
-    deadband_k: float  # calibrated deadband = max(floor, k * sigma of resting intent)
+    deadband_percentile: float  # calibrated deadband = max(floor, this percentile of |intent|)
     gain: tuple[float, ...]  # rad/s^2 per unit intent
     damping: tuple[float, ...]  # 1/s
     q_min: tuple[float, ...]
@@ -78,8 +83,16 @@ class ControllerConfig:
                 "blanking_correction must be on with zero fill (zeros bias the stimulated "
                 "side's envelope down) and off with hold fill (nothing to correct)"
             )
-        if not 0 <= self.deadband_floor < 1 or self.deadband_k < 0:
-            raise ValueError("deadband_floor must be in [0, 1) and deadband_k >= 0")
+        if any(not 0 < f < self.emg_fs_hz / 2 for f in self.notch_hz) or self.notch_q <= 0:
+            raise ValueError("notch_hz must be in (0, fs/2) and notch_q > 0")
+        if any(not 0 < f < self.emg_fs_hz / 2 for f in self.mains_cancel_hz):
+            raise ValueError("mains_cancel_hz must be in (0, fs/2)")
+        if self.mains_cancel_hz and not (
+            0 < self.mains_cancel_mu < 0.1 and 0 < self.mains_cancel_mu_bias < 1
+        ):
+            raise ValueError("mains canceller needs 0 < mu < 0.1 and 0 < mu_bias < 1")
+        if not 0 <= self.deadband_floor < 1 or not 50 < self.deadband_percentile <= 100:
+            raise ValueError("deadband_floor in [0, 1), deadband_percentile in (50, 100]")
         if not 0 <= self.allocation_offset < 1:
             raise ValueError("allocation_offset must be in [0, 1)")
         if self.allocation_offset > 0 and self.allocation_epsilon <= 0:
@@ -100,15 +113,32 @@ class ControllerConfig:
 
 
 def default_front_end(cfg: ControllerConfig) -> EMGFrontEnd:
-    """[blanking] -> bandpass -> rectify -> lowpass envelope -> [blanking correction]."""
+    """[mains canceller] -> [blanking] -> [notch] -> bandpass -> rectify -> lowpass envelope
+    -> [correction]."""
     lo, hi = cfg.bandpass_hz
+    envelope = lowpass(cfg.envelope_hz, cfg.envelope_order, cfg.emg_fs_hz, cfg.n_emg)
     stages = [
+        *(notch(f, cfg.notch_q, cfg.emg_fs_hz, cfg.n_emg) for f in cfg.notch_hz),
         bandpass(lo, hi, cfg.bandpass_order, cfg.emg_fs_hz, cfg.n_emg),
         Rectify(),
-        lowpass(cfg.envelope_hz, cfg.envelope_order, cfg.emg_fs_hz, cfg.n_emg),
+        envelope,
     ]
     if cfg.blanking_s > 0:
-        stages.insert(0, StimBlanking(cfg.emg_fs_hz, cfg.blanking_s, cfg.n_emg, cfg.blanking_fill))
+        blank = StimBlanking(cfg.emg_fs_hz, cfg.blanking_s, cfg.n_emg, cfg.blanking_fill)
+        stages.insert(0, blank)
+        if cfg.blanking_correction:
+            stages.append(BlankingCorrection(blank, envelope.sos))
+    if cfg.mains_cancel_hz:
+        blanking = stages[0] if cfg.blanking_s > 0 else None
+        canceller = MainsCanceller(
+            cfg.mains_cancel_hz,
+            cfg.emg_fs_hz,
+            cfg.n_emg,
+            cfg.mains_cancel_mu,
+            cfg.mains_cancel_mu_bias,
+            blanking,
+        )
+        stages.insert(0, canceller)
     return EMGFrontEnd(stages)
 
 

@@ -1,0 +1,8 @@
+# D6 confirmation (damping 10, G/b = 5) with the D14/D15/D16 front end, 20 seeds, and the
+# inner PD gain check: kp 0.8 (old default) vs 0.6. Also the no-fault false-trip check.
+name: d6_confirm
+grid:
+  scenario: [configs/scenarios/step_targets.yaml, configs/scenarios/no_intent.yaml]
+  patient: [configs/patients/healthy.yaml, configs/patients/sci_c5.yaml]
+  controller.joints.r_elbow_flex.kp: [0.6, 0.8]
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]

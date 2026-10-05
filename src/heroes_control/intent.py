@@ -35,15 +35,15 @@ def calibrate_deadband(
     normalized_rest: np.ndarray,
     agonist: tuple[int, ...],
     antagonist: tuple[int, ...],
-    k: float,
+    percentile: float,
     floor: float,
 ) -> tuple[float, ...]:
-    """Per-joint deadband = max(floor, k * std of raw resting intent).
+    """Per-joint deadband = max(floor, `percentile` of |raw intent|) over a rest recording.
 
-    `normalized_rest[n, J]`: normalized envelopes during calibration rest (no effort, no
-    stim). Sets the deadband relative to this patient's own noise floor, since in a double
-    integrator it is what stands between resting noise and reference drift.
+    `normalized_rest[n, J]`: normalized envelopes at rest, recorded with stimulation running
+    at a typical level (D14), so the deadband covers the artifact leak too. Rest intent is
+    rectified and heavy-tailed, so a tail percentile is used, not k * sigma.
     """
     x = np.asarray(normalized_rest, dtype=np.float64)
-    raw = x[:, list(agonist)] - x[:, list(antagonist)]
-    return tuple(float(max(floor, min(k * sd, 0.99))) for sd in raw.std(axis=0))
+    raw = np.abs(x[:, list(agonist)] - x[:, list(antagonist)])
+    return tuple(float(max(floor, min(p, 0.99))) for p in np.percentile(raw, percentile, axis=0))

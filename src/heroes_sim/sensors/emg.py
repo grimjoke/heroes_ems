@@ -125,6 +125,8 @@ class EMGSensor:
         self.artifact_gain = 1.0  # fault: artifact increase
         self.channel_fault: dict[int, str] = {}  # fault: channel -> "dropout" | "saturation"
         self._sample = 0
+        self._amp_prev_y = np.zeros(self.n_channels)  # overload recovery state (H2)
+        self._recovering = np.zeros(self.n_channels, dtype=bool)
         self._pending = np.zeros((self._pulse_len, self.n_channels))
         self._bw_zi = np.zeros((self._bw_sos.shape[0], 2, self.n_channels))
 
@@ -144,6 +146,36 @@ class EMGSensor:
             amp = self.S @ (self._mwave_amp * pulse.muscle_recruitment)  # [J]
             k = self._mwave_kernel
             self._pending[offset : offset + len(k)] += k[:, None] * amp[None, :]
+
+    def _amplifier(self, x: np.ndarray) -> np.ndarray:
+        """Clip at +-rail (either sign); after saturation, the output relaxes back to the
+        input with `overload_recovery_ms` (H2): the gap decays as exp(-t / tau)."""
+        rail = self.cfg.saturation_mv
+        if rail is None:
+            return x
+        y = np.clip(x, -rail, rail)
+        tau = self.cfg.amplifier.overload_recovery_ms * 1e-3
+        if tau <= 0 or len(x) == 0:
+            return y
+        a = np.exp(-1.0 / (self.fs * tau))
+        sat = np.abs(x) >= rail
+        for j in range(x.shape[1]):
+            if not (self._recovering[j] or sat[:, j].any()):
+                continue
+            py, rec = self._amp_prev_y[j], self._recovering[j]
+            for i in range(len(x)):
+                xi = x[i, j]
+                if sat[i, j]:
+                    rec = True
+                elif rec:  # relax from where the output is toward the input
+                    gap = a * (py - xi)
+                    y[i, j] = np.clip(xi + gap, -rail, rail)
+                    if abs(gap) < 1e-6 * rail:
+                        rec = False
+                py = y[i, j]
+            self._recovering[j] = rec
+        self._amp_prev_y = y[-1].copy()
+        return y
 
     def chunk(self, u_vol: np.ndarray, qd: np.ndarray | None = None) -> np.ndarray:
         """Raw EMG for n consecutive samples given volitional excitation (and joint
@@ -172,8 +204,7 @@ class EMGSensor:
             emg += cfg.baseline_wander.std_mv * self._bw_norm * drift
         if cfg.motion.enabled and qd is not None:
             emg += np.asarray(qd) @ self.M.T
-        if cfg.saturation_mv is not None:
-            emg = np.clip(emg, -cfg.saturation_mv, cfg.saturation_mv)
+        emg = self._amplifier(emg)
         for j, mode in self.channel_fault.items():
             if mode == "dropout":  # lead off: only the amplifier's own noise floor remains
                 emg[:, j] = cfg.white_noise.std_mv * self._rng_noise.standard_normal(n)

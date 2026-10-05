@@ -4,6 +4,8 @@ import pytest
 from heroes_sim.config import CalibrationConfig, MovementScenario
 from heroes_sim.scenario import MVCSchedule, TargetTrajectory
 
+STIM_REST = {"duration_s": 1.0, "settle_s": 0.0, "intensity": {}}
+
 
 def traj(segments, q0=0.5):
     sc = MovementScenario.model_validate(
@@ -41,6 +43,8 @@ def test_mvc_schedule():
             "lock_q": [1.0],
             "rest_s": 1.0,
             "window_s": 0.5,
+            "stim_rest": STIM_REST,
+            "quality": {"min_rest_over_floor": 1.5},
             "trials": [{"group": "a", "effort_s": 2.0}, {"group": "b", "effort_s": 1.0}],
         }
     )
@@ -57,6 +61,8 @@ def test_window_longer_than_effort_rejected():
                 "lock_q": [1.0],
                 "rest_s": 0.0,
                 "window_s": 2.0,
+                "stim_rest": STIM_REST,
+                "quality": {"min_rest_over_floor": 1.5},
                 "trials": [{"group": "a", "effort_s": 1.0}],
             }
         )

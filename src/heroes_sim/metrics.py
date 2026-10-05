@@ -150,6 +150,9 @@ def summarize(cfg: SimConfig, result: Any, events: pd.DataFrame) -> dict[str, fl
             else:
                 m[f"ref_rmse_{j}"] = tracking_rmse(log, j, cfg.metrics, of="ref")
     if sc.closed_loop:
+        mvc = getattr(result, "mvc", None)
+        if mvc is not None and mvc.deadband is not None:
+            m.update({f"deadband_{j}": float(d) for j, d in zip(cfg.plant.joints, mvc.deadband)})
         for ch in cfg.stim.channels:
             m[f"stim_dose_{ch.name}"] = stim_dose(log, ch.name)
             m[f"time_at_cap_{ch.name}"] = time_at_cap(log, ch.name, cfg.safety.cap[ch.name])

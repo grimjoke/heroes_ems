@@ -23,10 +23,15 @@ def config(**kw):
         "blanking_s": 0.0,
         "blanking_fill": "hold",
         "blanking_correction": False,
+        "notch_hz": (),
+        "notch_q": 30.0,
+        "mains_cancel_hz": (),
+        "mains_cancel_mu": 0.0,
+        "mains_cancel_mu_bias": 0.0,
         "agonist": (0,),
         "antagonist": (1,),
         "deadband_floor": 0.05,
-        "deadband_k": 3.0,
+        "deadband_percentile": 99.0,
         "gain": (50.0,),
         "damping": (10.0,),
         "q_min": (0.1,),
@@ -127,7 +132,7 @@ def test_reference_double_integrates_and_clamps():
     )
     ref.reset(np.array([0.5]))
     v, q = ref(np.array([1.0]))
-    assert v[0] == pytest.approx(0.1) and q[0] == pytest.approx(0.501)
+    assert v[0] == pytest.approx(0.1) and q[0] == pytest.approx(0.5005)  # exact: G dt^2 / 2
     for _ in range(200):
         v, q = ref(np.array([1.0]))
     assert q[0] == 1.0 and v[0] == 0.0  # clamped, no velocity wind-up into the limit
@@ -225,13 +230,22 @@ def test_allocation_offset_is_gated():
 
 
 def test_calibrated_deadband():
-    """D5: deadband = max(floor, k * sigma of resting raw intent)."""
+    """D14: deadband = max(floor, 99th percentile of |raw intent|) at stim-on rest."""
     rng = np.random.default_rng(0)
-    rest = np.stack([0.1 * rng.standard_normal(20000), np.zeros(20000)], axis=1)
-    (db,) = calibrate_deadband(rest, (0,), (1,), k=3.0, floor=0.05)
-    assert db == pytest.approx(0.3, rel=0.03)
+    rest = np.stack([0.1 * rng.standard_normal(200000), np.zeros(200000)], axis=1)
+    (db,) = calibrate_deadband(rest, (0,), (1,), percentile=99.0, floor=0.05)
+    assert db == pytest.approx(0.1 * 2.5758, rel=0.02)  # 99th pct of |N(0, 0.1)|
     quiet = rest * 0.01
-    assert calibrate_deadband(quiet, (0,), (1,), k=3.0, floor=0.05) == (0.05,)
+    assert calibrate_deadband(quiet, (0,), (1,), percentile=99.0, floor=0.05) == (0.05,)
+
+
+def test_percentile_deadband_sees_a_one_sided_tail():
+    """Rectified, heavy-tailed rest intent: k * sigma would sit well inside the tail."""
+    rng = np.random.default_rng(1)
+    tail = np.zeros((10000, 2))
+    tail[:, 1] = np.maximum(0.02 * rng.standard_cauchy(10000), 0.0)  # one-sided, heavy
+    (db,) = calibrate_deadband(tail, (0,), (1,), percentile=99.0, floor=0.0)
+    assert np.mean(np.abs(tail[:, 0] - tail[:, 1]) > db) == pytest.approx(0.01, abs=0.002)
 
 
 def test_pipeline_uses_calibrated_deadband():
@@ -245,3 +259,30 @@ def test_normalization_clamps_at_zero():
     """D4: below-rest envelope reads as zero effort, never negative."""
     norm = MVCNormalizer(MVCValues((0.5,), (0.1,)))
     assert norm(np.array([0.02]))[0] == 0.0
+
+
+def test_damped_reference_is_a_velocity_mapping():
+    """D6: steady intent u settles at (G / b) u rad/s with time constant 1 / b."""
+    g, b, dt = 50.0, 10.0, 0.01
+    ref = DoubleIntegratorReference(
+        np.array([g]), np.array([b]), np.array([-1e9]), np.array([1e9]), dt
+    )
+    ref.reset(np.array([0.0]))
+    vs = [ref(np.array([0.2]))[0][0] for _ in range(100)]
+    assert vs[-1] == pytest.approx(g / b * 0.2, rel=1e-4)
+    tau_tick = round(1 / b / dt)  # after one time constant: 1 - 1/e of the final value
+    assert vs[tau_tick - 1] == pytest.approx(g / b * 0.2 * (1 - np.exp(-1)), rel=1e-9)
+
+
+def test_reference_discretisation_is_exact():
+    """Matches the closed-form solution of v' = G u - b v, q' = v for any b * dt."""
+    g, b, dt, u = 50.0, 10.0, 0.05, 0.3  # b * dt = 0.5: forward Euler would be 10% off
+    ref = DoubleIntegratorReference(
+        np.array([g]), np.array([b]), np.array([-1e9]), np.array([1e9]), dt
+    )
+    ref.reset(np.array([0.0]))
+    for _ in range(4):
+        v, q = ref(np.array([u]))
+    t, vinf = 4 * dt, g / b * u
+    assert v[0] == pytest.approx(vinf * (1 - np.exp(-b * t)), rel=1e-12)
+    assert q[0] == pytest.approx(vinf * (t - (1 - np.exp(-b * t)) / b), rel=1e-12)
