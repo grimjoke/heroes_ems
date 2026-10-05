@@ -260,3 +260,12 @@ def test_canceller_frozen_during_blanks_and_chunking_independent():
     _, mc_clean = run(x, 20)
     np.testing.assert_allclose(mc._coef, mc_clean._coef, atol=1e-12)  # artifacts never fitted
     np.testing.assert_array_equal(y, run(spiky, 7)[0])
+
+
+def test_canceller_converges_within_a_few_mains_cycles():
+    from heroes_control.blanking import MainsCanceller
+
+    t = np.arange(2000) / FS
+    x = (0.02 * np.sin(2 * np.pi * 50 * t + 1.0) + 0.006 * np.sin(2 * np.pi * 100 * t))[:, None]
+    y = MainsCanceller((50.0, 100.0), FS, 1, 0.002, 0.02).process(t[-1], x)
+    assert np.abs(y[200:]).max() < 0.1 * np.abs(x).max()  # after 0.1 s (5 cycles)

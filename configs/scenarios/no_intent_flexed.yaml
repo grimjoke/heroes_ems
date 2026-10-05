@@ -1,0 +1,11 @@
+# no_intent with the arm starting flexed: the reference holds 1.2 rad and stim alone carries
+# the gravity load (the patient intends nothing). Seed-0 no_intent at 0.54 rad missed the
+# inner-loop limit cycle this exposes (README finding 12, D18).
+kind: movement
+name: no_intent_flexed
+patient_file: ../patients/healthy.yaml
+duration_s: 10.0
+initial_state: {q: [1.2], qd: [0.0]}
+closed_loop: true
+stim_off_baseline: true
+target: null

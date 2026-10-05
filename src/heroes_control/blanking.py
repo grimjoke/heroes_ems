@@ -166,7 +166,10 @@ class MainsCanceller:
     and, unlike a notch filter, it cannot ring after a pulse. A bias term tracks baseline
     wander for the adaptation error only (not subtracted); without it the wander's gradient
     noise jitters the fit and adds a tail of fake EMG. Time constants: about 2 / mu samples
-    for the sinusoids, 1 / mu_bias for the bias.
+    for the sinusoids, 1 / mu_bias for the bias. Fast start: the step size begins at the
+    running-mean gain (2 / k for the sinusoids, 1 / k for the bias, k = samples fitted) and
+    decays to mu, so the fit is converged within a few mains cycles of a reset instead of
+    leaving mains in the first ~2 / mu samples, where it would read as intent.
     """
 
     def __init__(
@@ -189,6 +192,7 @@ class MainsCanceller:
         self._coef = np.zeros((2 * len(self._w), self._n))
         self._bias = np.zeros(self._n)
         self._k = 0  # samples since reset (phase reference)
+        self._fitted = 0  # unblanked samples fitted since reset (fast-start step size)
 
     def process(self, t: float, chunk: np.ndarray) -> np.ndarray:
         n = len(chunk)
@@ -201,12 +205,13 @@ class MainsCanceller:
         ref = np.concatenate([np.cos(phase), np.sin(phase)], axis=1)  # [n, 2H]
         self._k += n
         out = np.empty_like(chunk)
-        coef, bias = self._coef, self._bias
+        coef, bias, k = self._coef, self._bias, self._fitted
         for i in range(n):  # sequential: each sample's fit uses the previous update
             out[i] = chunk[i] - ref[i] @ coef
             if not blanked[i]:
+                k += 1
                 e = out[i] - bias
-                bias = bias + self._mu_bias * e
-                coef = coef + self._mu * np.outer(ref[i], e)
-        self._coef, self._bias = coef, bias
+                bias = bias + max(self._mu_bias, 1.0 / k) * e
+                coef = coef + max(self._mu, 2.0 / (k + 1)) * np.outer(ref[i], e)
+        self._coef, self._bias, self._fitted = coef, bias, k
         return out
