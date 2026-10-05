@@ -16,7 +16,7 @@ from pathlib import Path
 
 from heroes_sim import metrics
 from heroes_sim.config import load_run_config
-from heroes_sim.runner import calibrate, pinned, run
+from heroes_sim.runner import CalibrationError, calibrate, pinned, run
 
 CLEAN = {
     f"emg.{c}.enabled": False for c in ("stim_artifact", "m_wave", "powerline", "baseline_wander")
@@ -59,7 +59,11 @@ def main() -> None:
             cfg = load_run_config(
                 scenarios / f"{name}.yaml", overrides=ov, patient_path=args.patient
             )
-            cal = calibrate(cfg, args.seed, "calibration/", None)
+            try:
+                cal = calibrate(cfg, args.seed, "calibration/", None)
+            except CalibrationError as e:  # D19: a silent channel fails the noise-floor gate
+                print(f"  {label:<26} calibration rejected: {e}")
+                continue
             ov = {**ov, "scenario.calibrated": pinned(cfg, cal)}
             cfg = load_run_config(
                 scenarios / f"{name}.yaml", overrides=ov, patient_path=args.patient
