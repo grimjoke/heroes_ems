@@ -4,7 +4,7 @@ A fast, headless, deterministic simulation of a person's arm in an **EMS-only el
 
 The exoskeleton has no motors. It reads the patient's muscle signals (surface EMG), works out what they are trying to do, and electrically stimulates their own muscles (EMS) to help. The **controller in this repo is the real one**: `heroes_control` and `heroes_safety` depend only on numpy/scipy, so the future ROS node on the device wraps the same code.
 
-Architecture and requirements: [SIM_SPEC.md](SIM_SPEC.md). Status: **M0–M4 done, M5 underway.** The closed loop has a realistic EMG model, stim-artifact blanking, muscle fatigue, fault injection, cluster sweeps and a safety supervisor that detects every simulated sensor and electrode fault. D6 and D14–D16 are resolved and implemented (reference damping, stim-on deadband calibration, interpolating blank with a notch after it, lead-off latch). Open decisions: mains under the blank (D17), the inner PD gain (D18), the calibration gate on a silent muscle (D19), and the reference after a fault (D20).
+**New here? Start with the [User Guide](docs/USER_GUIDE.md).** Architecture and requirements: [SIM_SPEC.md](SIM_SPEC.md). Status: **M0–M4 done, M5 underway.** The closed loop has a realistic EMG model, stim-artifact blanking, muscle fatigue, fault injection, cluster sweeps and a safety supervisor that detects every simulated sensor and electrode fault. D6 and D14–D16 are resolved and implemented (reference damping, stim-on deadband calibration, interpolating blank with a notch after it, lead-off latch). Open decisions: mains under the blank (D17), the inner PD gain (D18), the calibration gate on a silent muscle (D19), and the reference after a fault (D20).
 
 ## The loop
 
@@ -41,7 +41,7 @@ uv run python scripts/artifact_demo.py                                    # M3: 
 uv run python scripts/fault_demo.py                                       # M4: each fault mid-hold, what safety catches
 uv run python scripts/make_sweep.py configs/sweeps/example.yaml           # M4: sweep -> SLURM or local (see Sweeps)
 uv run python scripts/passive_drop.py                                     # M0: arm falls under gravity
-uv run pytest                                                             # 177 tests, ~1.5 min
+uv run pytest                                                             # ~200 tests, ~2 min
 ```
 
 ## Running scenarios
@@ -61,10 +61,11 @@ Any movement scenario can also carry **faults** and **perturbations**, each acti
 
 | Fault `kind` | Effect |
 |---|---|
-| `electrode_detach` (`channel`: stim) | The electrode delivers nothing: no recruitment, no artifact. The controller does not know. |
-| `emg_dropout` (`channel`: EMG) | The EMG channel reads a flat 0 (lead off). |
-| `emg_saturation` (`channel`: EMG) | The EMG channel is stuck at the amplifier rail (`emg.saturation_mv`). |
-| `angle_freeze` (`joint`) | The angle sensor repeats its last reading. |
+| `electrode_detach` (`channel`: stim, `contact`) | `contact` 0: the electrode delivers nothing. 0 < `contact` < 1: same current through less area, so current density rises. The controller does not know. |
+| `emg_dropout` (`channel`: EMG) | Lead off: the channel reads only the amplifier noise floor. |
+| `emg_saturation` (`channel`: EMG) | The EMG channel is stuck at the amplifier rail (supply / 2 / gain). |
+| `angle_freeze` (`joint`) | Fresh angle messages carry a frozen value. |
+| `angle_stale` | The angle driver republishes its last message, timestamp unchanged. |
 | `artifact_increase` (`factor`) | Stim artifact amplitude multiplied, e.g. as electrode gel dries. |
 
 `perturbations: [{t_start, t_end, torque: {joint: N·m}}]` applies an external torque (+ = flexion). For example:
