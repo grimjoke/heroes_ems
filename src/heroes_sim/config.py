@@ -207,6 +207,7 @@ class MovementScenario(_Strict):
     calibrated: CalibratedValues | None = None  # None -> run the calibration trial first
     stim_off_baseline: bool = False  # also run stim-off (open loop) for baseline metrics
     faults: list[Fault] = Field(default_factory=list)
+    operator_resets: list[float] = Field(default_factory=list)  # lead-off reset requests (D16)
     perturbations: list[Perturbation] = Field(default_factory=list)
 
 
@@ -263,6 +264,14 @@ class MotionArtifactConfig(_Strict):
     gain_mv_per_rad_s: dict[str, dict[str, float]]  # EMG channel -> joint -> mV per rad/s
 
 
+class AmplifierConfig(_Strict):
+    """EMG amplifier front end (H1, H2): output 0..supply_v centred at supply_v / 2."""
+
+    supply_v: float = Field(gt=0)  # H1: 3.3 or 5 V
+    raw_gain: float = Field(gt=0)  # H1: RAW output gain (~200 reported; verify on the bench)
+    overload_recovery_ms: float = Field(ge=0)  # H2: time constant back from the rail; 0 = ideal
+
+
 class EMGConfig(_Strict):
     channels: list[EMGChannelConfig] = Field(min_length=1)
     volitional: VolitionalEMGConfig
@@ -272,7 +281,13 @@ class EMGConfig(_Strict):
     powerline: PowerlineConfig
     baseline_wander: BaselineWanderConfig
     motion: MotionArtifactConfig
-    saturation_mv: float | None = Field(gt=0)  # amplifier clipping; None -> no clipping
+    amplifier: AmplifierConfig | None  # None -> ideal amplifier, no clipping
+
+    @property
+    def saturation_mv(self) -> float | None:
+        """Input-referred rail: the output swings 0..Vs centred on Vs/2, so +-Vs/2/gain."""
+        a = self.amplifier
+        return None if a is None else 1000.0 * a.supply_v / 2.0 / a.raw_gain
 
 
 class AngleSensorConfig(_Strict):
@@ -337,16 +352,27 @@ class AllocationConfig(_Strict):
         return self
 
 
+class MainsCancellerConfig(_Strict):
+    """D17: adaptive mains canceller ahead of blanking (LMS, frozen during blanks)."""
+
+    freqs_hz: list[float] = Field(min_length=1)  # mains fundamental and harmonics
+    mu: float = Field(gt=0, lt=0.1)  # sinusoid step; time constant ~2 / mu samples
+    mu_bias: float = Field(gt=0, lt=1)  # wander-tracking bias step
+
+
 class ControllerSection(_Strict):
     bandpass_hz: tuple[float, float]
     bandpass_order: int = Field(ge=1)
     envelope_hz: float = Field(gt=0)
     envelope_order: int = Field(ge=1)
     blanking_ms: float = Field(ge=0)  # 0 -> no blanking stage
-    blanking_fill: Literal["hold", "zero"]
-    blanking_correction: bool  # must be true with zero fill, false with hold
+    blanking_fill: Literal["interp", "hold", "zero"]
+    blanking_correction: bool  # must be true with zero fill, false otherwise
+    notch_hz: list[float]  # D15: mains notch(es) after blanking; [] = none
+    notch_q: float = Field(gt=0)
+    mains_canceller: MainsCancellerConfig | None  # D17 (open); None = off
     deadband_floor: float = Field(ge=0, lt=1)  # lower bound for the calibrated deadband
-    deadband_k: float = Field(ge=0)  # deadband = max(floor, k * sigma of resting intent)
+    deadband_percentile: float = Field(gt=50, le=100)  # D14: of |intent| at stim-on rest
     allocation: AllocationConfig
     derivative_tau_s: float = Field(ge=0)
     latency_ticks: int = Field(ge=0)  # compute latency before output takes effect
@@ -366,6 +392,8 @@ class SafetySection(_Strict):
     emg_rail_min_samples: int = Field(ge=0)  # D10: per chunk at either rail; 0 = off
     emg_dead_ratio: float = Field(ge=0, lt=1)  # D10: chunk std / resting std; 0 = off
     emg_dead_ticks: int = Field(ge=1)
+    emg_dead_latch: bool  # D16: latch lead-off until an operator reset (False: auto-clear)
+    emg_dead_reset_s: float = Field(gt=0)  # channel must be live this long before a reset
     angle_max_age_s: float | None = Field(gt=0)  # D11 primary: message age; None = off
     angle_repeat_ticks: int = Field(ge=0)  # D11 fallback: identical readings; 0 = off
     impedance_max_ohm: float | None = Field(gt=0)  # D12: per stim channel; None = off
@@ -376,13 +404,35 @@ class MVCTrial(_Strict):
     effort_s: float = Field(gt=0)
 
 
+class StimRestConfig(_Strict):
+    """D14: rest with stimulation running at a typical level, arm supported (joint locked).
+    The deadband is set from intent noise here, so it includes the artifact leak."""
+
+    duration_s: float = Field(gt=0)  # 30-60 s
+    settle_s: float = Field(ge=0)  # ignored at the start (filters, envelope settling)
+    intensity: dict[str, float]  # stim channel -> typical intensity
+
+
+class CalibrationQuality(_Strict):
+    """Gate: each EMG channel's resting std must exceed this multiple of the amplifier noise
+    floor (emg.white_noise.std_mv, H4), else calibration fails (dead/detached lead)."""
+
+    min_rest_over_floor: float = Field(gt=1)
+
+
 class CalibrationConfig(_Strict):
-    """MVC protocol: isometric max effort per muscle group, joint locked at lock_q."""
+    """MVC protocol: isometric max effort per muscle group, joint locked at lock_q; then a
+    rest with stimulation on (D14)."""
 
     lock_q: list[float]
     rest_s: float = Field(ge=0)
     trials: list[MVCTrial] = Field(min_length=1)
     window_s: float = Field(gt=0)  # MVC value = mean over the best window within each effort
+    stim_rest: StimRestConfig
+    quality: CalibrationQuality
+
+    def calibration_stim_names(self) -> list[str]:
+        return list(self.stim_rest.intensity)
 
     @model_validator(mode="after")
     def _window_fits(self) -> CalibrationConfig:
@@ -454,6 +504,10 @@ class SimConfig(_Strict):
                 vecs += [getattr(seg, f) for f in ("q", "center", "amplitude") if hasattr(seg, f)]
             if any(len(v) != n for v in vecs):
                 raise ValueError(f"scenario joint vectors must have length {n}")
+        if self.calibration is not None and self.stim is not None:
+            names = {c.name for c in self.stim.channels}
+            if set(self.calibration.calibration_stim_names()) != names:
+                raise ValueError("calibration.stim_rest.intensity must give every stim channel")
         if self.calibration is not None:
             if len(self.calibration.lock_q) != n:
                 raise ValueError(f"calibration.lock_q must have length {n}")
@@ -515,7 +569,7 @@ class SimConfig(_Strict):
                 elif isinstance(f, AngleFreeze):
                     need([f.joint], joints, "angle_freeze joint")
                 if isinstance(f, EMGSaturation) and self.emg.saturation_mv is None:
-                    raise ValueError("emg_saturation fault needs emg.saturation_mv (the rail)")
+                    raise ValueError("emg_saturation fault needs emg.amplifier (the rail)")
             for p in sc.perturbations:
                 need(p.torque, joints, "perturbation torque")
         if isinstance(sc, MovementScenario) and sc.calibrated is not None:

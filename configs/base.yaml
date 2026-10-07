@@ -2,7 +2,7 @@ timing:
   physics_hz: 2000
   emg_hz: 2000
   controller_hz: 100
-  stim_hz: 25                 # event clock: any rate <= physics_hz (pulses snap to the nearest step)
+  stim_hz: 30                 # D15: off 25 Hz (= mains / 2: every blank at the same mains phase); event clock
   angle_sensor_hz: 100
 
 plant:
@@ -35,6 +35,12 @@ calibration:                  # MVC protocol; runs before every closed-loop epis
   trials:
     - {group: elbow_flexors, effort_s: 3.0}
     - {group: elbow_extensors, effort_s: 3.0}
+  stim_rest:                  # D14: rest with stim at a typical level, arm supported (locked)
+    duration_s: 30.0
+    settle_s: 2.0
+    intensity: {biceps_stim: 0.2, triceps_stim: 0.2}
+  quality:
+    min_rest_over_floor: 1.5  # resting EMG std must exceed 1.5 x amplifier noise floor (H4)
 
 emg:
   channels:                   # weights = row of S[J, M]; off-target weights are crosstalk
@@ -76,7 +82,10 @@ emg:
     gain_mv_per_rad_s:
       biceps: {r_elbow_flex: 0.05}
       triceps: {r_elbow_flex: 0.05}
-  saturation_mv: 10.0
+  amplifier:                  # rail = supply_v / 2 / raw_gain, input-referred (3.3 V, 200 -> 8.25 mV)
+    supply_v: 3.3             # H1: 3.3 or 5 V? (5 V -> 12.5 mV)
+    raw_gain: 200.0           # H1: reported RAW gain; verify on the bench
+    overload_recovery_ms: 5.0 # H2: placeholder until measured (datasheet: CMOS amps recover slowly)
 
 angle_sensor:
   noise_std_rad: 0.003
@@ -104,17 +113,20 @@ controller:
   envelope_hz: 4.0
   envelope_order: 2
   blanking_ms: 15.0           # software blanking (EMG amp has none); covers M-wave (4 + 10 ms); sweep at M5
-  blanking_fill: hold         # sample-and-hold; "zero" notches slow offsets and biases the stimulated side
-  blanking_correction: false  # must be true with zero fill, false with hold
-  deadband_floor: 0.05        # calibrated deadband = max(floor, k * sigma of resting intent)
-  deadband_k: 3.0
+  blanking_fill: interp       # D15: line across the blank (delays EMG by window + 1 sample); hold | zero for comparison
+  blanking_correction: false  # must be true with zero fill, false otherwise
+  notch_hz: [50.0]            # D15: mains notch AFTER blanking (before it, artifact spikes make it ring)
+  notch_q: 30.0
+  mains_canceller: null       # D17 (open): {freqs_hz: [50, 100, 150], mu: 0.002, mu_bias: 0.02}
+  deadband_floor: 0.05        # D14: deadband = max(floor, percentile of |intent| at stim-on rest)
+  deadband_percentile: 99.0
   allocation:                 # recruitment-threshold offset; 0 = plain split (sweep at M5)
     offset: 0.0
     epsilon: 0.02             # the offset applies only above this PD output
   derivative_tau_s: 0.02
   latency_ticks: 1            # 10 ms compute latency
-  joints:                     # damping 0 = pure double integration, as on hardware; kp >= ~1.2 limit-cycles for sci_c5
-    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 0.0, rom: [0.1, 2.1], kp: 0.8, kd: 0.03}
+  joints:                     # D6: damping 10 -> G/b = 5 rad/s per intent, tau 100 ms. D18: kp 0.3 interim (>= 0.4 crosses the joint limit holding flexed)
+    r_elbow_flex: {agonist: biceps, antagonist: triceps, gain: 50.0, damping: 10.0, rom: [0.1, 2.1], kp: 0.3, kd: 0.03}
 
 safety:
   cap: {biceps_stim: 0.8, triceps_stim: 0.8}
@@ -127,9 +139,11 @@ safety:
   q_plausible: {r_elbow_flex: [-0.3, 2.6]}
   emg_plausible_abs_mv: 20.0
   # D10-D12 detectors. Thresholds from 395 fault-free M5 sweep runs (see README):
-  emg_rail_min_samples: 10    # of 20 per chunk at |x| >= 0.98 x rail (emg.saturation_mv); 0 seen fault-free
+  emg_rail_min_samples: 10    # of 20 per chunk at |x| >= 0.98 x rail (emg.amplifier); 0 seen fault-free
   emg_dead_ratio: 0.5         # chunk std / calibrated resting std; fault-free never < 0.5 for > 3 ticks
   emg_dead_ticks: 10
+  emg_dead_latch: true        # D16: lead-off stays latched until an operator reset
+  emg_dead_reset_s: 3.0       # reset accepted only after the channel has been live this long
   angle_max_age_s: 0.05       # primary (D11): message age; sensor latency 10 ms + one 10 ms tick
   angle_repeat_ticks: 10      # fallback (D11): identical readings; fault-free max 5 over 395 runs
-  impedance_max_ohm: 2000.0   # D12: 2x nominal = contact below 50% (placeholder: electrode/stimulator spec)
+  impedance_max_ohm: null     # D12/H7: this stimulator reports no impedance -> no data source (hardware risk)

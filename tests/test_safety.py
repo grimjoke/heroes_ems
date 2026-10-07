@@ -164,6 +164,7 @@ def detectors(**kw):
         "emg_rail_min_samples": 10,
         "emg_dead_ratio": 0.5,
         "emg_dead_ticks": 10,
+        "emg_dead_latch": False,  # the hysteresis tests below; latch tests set True
         "angle_max_age_s": 0.05,
         "angle_repeat_ticks": 10,
         "impedance_max_ohm": 2000.0,
@@ -280,3 +281,41 @@ def test_detector_config_validated():
         config(emg_rail_min_samples=5)  # count without a rail
     with pytest.raises(ValueError):
         config(emg_dead_ratio=1.5)
+
+
+# ---- D16: lead-off latch --------------------------------------------------------------
+
+
+def dead_then_live(sup, rng, n_dead=12, n_live=0, start=0):
+    outs = []
+    for i in range(n_dead):
+        emg = live_emg(rng)
+        emg[:, 1] = 0.002 * rng.standard_normal(20)
+        outs.append(tick(sup, start + i, emg))
+    for i in range(n_live):
+        outs.append(tick(sup, start + n_dead + i, live_emg(rng)))
+    return outs
+
+
+def test_lead_off_latches_until_reset():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(emg_dead_latch=True, emg_dead_reset_ticks=300), REST_STD)
+    outs = dead_then_live(sup, rng, n_live=400)
+    assert all(o.fired["emg_dead"].all() for o in outs[10:])  # stays tripped while live again
+    assert sup.request_lead_off_reset()  # 400 live ticks >= 300 -> accepted
+    assert not tick(sup, 500, live_emg(rng)).fired["emg_dead"].any()
+
+
+def test_lead_off_reset_refused_until_live_long_enough():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(emg_dead_latch=True, emg_dead_reset_ticks=300), REST_STD)
+    dead_then_live(sup, rng, n_live=100)
+    assert not sup.request_lead_off_reset()  # only 1 s live: refused, still latched
+    assert tick(sup, 200, live_emg(rng)).fired["emg_dead"].all()
+
+
+def test_lead_off_auto_clear_option():
+    rng = np.random.default_rng(0)
+    sup = SafetySupervisor(detectors(emg_dead_latch=False), REST_STD)
+    outs = dead_then_live(sup, rng, n_live=12)
+    assert outs[-1].fired["emg_dead"].sum() == 0  # cleared by itself after 10 live ticks

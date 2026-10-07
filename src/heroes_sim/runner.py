@@ -70,10 +70,15 @@ def build_controller_config(cfg: SimConfig) -> ControllerConfig:
         blanking_s=c.blanking_ms * 1e-3,
         blanking_fill=c.blanking_fill,
         blanking_correction=c.blanking_correction,
+        notch_hz=tuple(c.notch_hz),
+        notch_q=c.notch_q,
+        mains_cancel_hz=tuple(c.mains_canceller.freqs_hz) if c.mains_canceller else (),
+        mains_cancel_mu=c.mains_canceller.mu if c.mains_canceller else 0.0,
+        mains_cancel_mu_bias=c.mains_canceller.mu_bias if c.mains_canceller else 0.0,
         agonist=tuple(emg.index(j.agonist) for j in joints),
         antagonist=tuple(emg.index(j.antagonist) for j in joints),
         deadband_floor=c.deadband_floor,
-        deadband_k=c.deadband_k,
+        deadband_percentile=c.deadband_percentile,
         gain=tuple(j.gain for j in joints),
         damping=tuple(j.damping for j in joints),
         q_min=tuple(j.rom[0] for j in joints),
@@ -110,6 +115,8 @@ def build_safety_config(cfg: SimConfig) -> SafetyConfig:
         emg_rail_min_samples=s.emg_rail_min_samples,
         emg_dead_ratio=s.emg_dead_ratio,
         emg_dead_ticks=s.emg_dead_ticks,
+        emg_dead_latch=s.emg_dead_latch,
+        emg_dead_reset_ticks=max(1, round(s.emg_dead_reset_s * cfg.timing.controller_hz)),
         angle_max_age_s=s.angle_max_age_s,
         angle_repeat_ticks=s.angle_repeat_ticks,
         impedance_max_ohm=s.impedance_max_ohm,
@@ -131,6 +138,7 @@ class Calibration:
     trials: list[MVCTrialResult]
     mvc: MVCValues  # MVC + rest per EMG channel, deadband per joint
     emg_rest_std: tuple[float, ...]  # raw-EMG chunk std at rest, per channel (dead-lead ref)
+    stim_rest_log: pd.DataFrame | None = None  # D14 phase: rest with stim at a typical level
 
 
 @dataclass(frozen=True)
@@ -181,7 +189,7 @@ def run(cfg: SimConfig, seed: int, on_step: StepHook | None = None) -> RunResult
             cal = calibrate(cfg, seed, "calibration/", None)
             mvc, rest_std = cal.mvc, cal.emg_rest_std
     ep = _Episode(cfg, seed, "", q0, qd0, lock=False, mvc=mvc, emg_rest_std=rest_std)
-    log = ep.run(sc.duration_s, intent_at, on_step, sc.faults, sc.perturbations)
+    log = ep.run(sc.duration_s, intent_at, on_step, sc.faults, sc.perturbations, sc.operator_resets)
     baseline = None
     if sc.stim_off_baseline and sc.closed_loop:
         # Same seed and component names -> same patient/sensor noise; only stim differs.
@@ -214,22 +222,60 @@ def calibrate(cfg: SimConfig, seed: int, prefix: str, on_step: StepHook | None) 
         env = log[f"env_{ch.name}"].to_numpy()
         mvc.append(float(_best_mean(env[log["mvc_group"] == ch.mvc_group], w)[0]))
         rest.append(float(env[at_rest].mean()))
-    # Deadband from resting intent noise, through the controller's own normalization.
-    ctrl = build_controller_config(cfg)
-    norm = MVCNormalizer(MVCValues(tuple(mvc), tuple(rest)))
-    env_rest = log.loc[at_rest, [f"env_{ch.name}" for ch in cfg.emg.channels]].to_numpy()
-    deadband = calibrate_deadband(
-        np.array([norm(e) for e in env_rest]),
-        ctrl.agonist,
-        ctrl.antagonist,
-        ctrl.deadband_k,
-        ctrl.deadband_floor,
-    )
-    values = MVCValues(tuple(mvc), tuple(rest), deadband)
     rest_std = tuple(
         float(log.loc[at_rest, f"emg_std_{ch.name}"].mean()) for ch in cfg.emg.channels
     )
-    return Calibration(log=log, trials=trials, mvc=values, emg_rest_std=rest_std)
+    _quality_gate(cfg, rest_std)
+
+    # D14: deadband from intent noise at rest WITH stimulation at a typical level (arm
+    # supported), so it sees the artifact leak it exists to reject. Normalized with the
+    # stim-off baseline (D4).
+    sr = cal.stim_rest
+    norm = MVCNormalizer(MVCValues(tuple(mvc), tuple(rest)))
+    level = np.array([sr.intensity[ch.name] for ch in cfg.stim.channels])
+    ep2 = _Episode(
+        cfg,
+        seed,
+        prefix + "stim_rest/",
+        lock_q,
+        np.zeros_like(lock_q),
+        True,
+        None,
+        fixed_stim=level,
+    )
+    stim_log = ep2.run(sr.duration_s, lambda t: NO_INTENT, None)
+    settled = stim_log["t"] > sr.settle_s
+    env2 = stim_log.loc[settled, [f"env_{ch.name}" for ch in cfg.emg.channels]].to_numpy()
+    ctrl = build_controller_config(cfg)
+    deadband = calibrate_deadband(
+        np.array([norm(e) for e in env2]),
+        ctrl.agonist,
+        ctrl.antagonist,
+        ctrl.deadband_percentile,
+        ctrl.deadband_floor,
+    )
+    values = MVCValues(tuple(mvc), tuple(rest), deadband)
+    return Calibration(
+        log=log, trials=trials, mvc=values, emg_rest_std=rest_std, stim_rest_log=stim_log
+    )
+
+
+class CalibrationError(ValueError):
+    """The calibration failed a quality gate; don't run the controller on it."""
+
+
+def _quality_gate(cfg: SimConfig, rest_std: tuple[float, ...]) -> None:
+    """Every EMG channel must show more than the amplifier's own noise floor at rest. A
+    channel that doesn't is a dead or detached lead, and normalizing by it would make noise
+    read as effort. The same floor gates the lead-off reset (D16)."""
+    q = cfg.calibration.quality
+    need = q.min_rest_over_floor * cfg.emg.white_noise.std_mv
+    bad = {ch.name: round(sd, 5) for ch, sd in zip(cfg.emg.channels, rest_std) if sd < need}
+    if bad:
+        raise CalibrationError(
+            f"resting EMG std below {q.min_rest_over_floor} x the amplifier noise floor "
+            f"({need:.4f} mV) on {bad}: check those leads and recalibrate"
+        )
 
 
 def pinned(cfg: SimConfig, cal: Calibration) -> dict:
@@ -342,7 +388,10 @@ class _Episode:
         lock: bool,
         mvc: MVCValues | None,
         emg_rest_std: tuple[float, ...] | None = None,
+        fixed_stim: np.ndarray | None = None,
     ):
+        """mvc given -> closed loop. fixed_stim given (open loop) -> the stimulator runs at
+        that intensity throughout, synced to the controller's EMG front end (calibration)."""
         self.cfg = cfg
         t = cfg.timing
         self.plant = Plant(cfg.plant, t)
@@ -383,6 +432,10 @@ class _Episode:
             self._queue = deque([(0.0, np.zeros(len(cfg.stim.channels)))] * n_lat)
         else:
             self.front_end = default_front_end(self.ctrl_cfg)
+            if fixed_stim is not None:
+                self.stim = StimModel(cfg.stim, cfg.plant.muscles, dt)
+        self.fixed_stim = None if fixed_stim is None else np.asarray(fixed_stim, dtype=float)
+        self.stimulating = self.closed_loop or self.fixed_stim is not None
         self.events: list[SafetyEvent] = []
 
     def _pulse(self, now: float, applied: np.ndarray, offset: int) -> None:
@@ -391,7 +444,12 @@ class _Episode:
         ev = self.stim.pulse(now, applied)
         if ev.active:
             self.emg.add_pulse(offset, ev)
-            self.controller.on_stim_pulse(now)
+            if self.closed_loop:
+                self.controller.on_stim_pulse(now)
+            else:
+                for stage in self.front_end.stages:
+                    if hasattr(stage, "on_pulse"):
+                        stage.on_pulse(now)
 
     def run(
         self,
@@ -400,9 +458,11 @@ class _Episode:
         on_step: StepHook | None,
         faults: list[Fault] | None = None,
         perturbations: list[Perturbation] | None = None,
+        operator_resets: list[float] | None = None,
     ) -> pd.DataFrame:
         cfg, plant = self.cfg, self.plant
         inject = _Injector(self, faults or [], perturbations or [])
+        resets = sorted(operator_resets or [])
         fault_names = [f"{i}_{f.kind}" for i, f in enumerate(inject.faults)]
         t = cfg.timing
         sched = Scheduler(t)
@@ -413,7 +473,7 @@ class _Episode:
         emg_names = self.emg.names
         stim_names = [ch.name for ch in cfg.stim.channels]
         n_stim = len(stim_names)
-        applied = np.zeros(n_stim)
+        applied = np.zeros(n_stim) if self.fixed_stim is None else self.fixed_stim.copy()
         u_buf = np.zeros((per_tick, len(muscles)))
         qd_buf = np.zeros((per_tick, len(joints)))
         u_stim = np.zeros(len(muscles))
@@ -429,7 +489,7 @@ class _Episode:
             u_vol = self.patient.step(intent, q, qd)
             u_buf[i] = u_vol
             i += 1
-            if self.closed_loop:
+            if self.stimulating:
                 u_stim = self.stim.step()
                 plant.step(self.stim.combine(u_vol, u_stim))
             else:
@@ -444,7 +504,7 @@ class _Episode:
             if ticks.angle_sensor:
                 self.q_meas = self.angle.sample(now)
             if not ticks.controller:
-                if ticks.stim and self.closed_loop:
+                if ticks.stim and self.stimulating:
                     self._pulse(now, applied, offset=i)
                 continue
 
@@ -454,6 +514,10 @@ class _Episode:
             if rail is not None:
                 log.put(k, "emg_rail", emg_names, (np.abs(emg_chunk) >= rail).sum(axis=0))
             if self.closed_loop:
+                while resets and resets[0] <= now:  # operator presses lead-off reset (D16)
+                    resets.pop(0)
+                    ok = self.supervisor.request_lead_off_reset()
+                    log.put(k, "operator_reset", ["accepted"], [float(ok)])
                 out = self.controller.step(now, emg_chunk, self.q_meas)
                 self._queue.append((out.t, out.intensity))
                 cmd_t, cmd = self._queue.popleft()
@@ -482,7 +546,7 @@ class _Episode:
                 log.put(k, "current_density", stim_names, self.stim.current_density(applied))
             else:
                 env = self.front_end.process(now, emg_chunk)[-1]
-            if ticks.stim and self.closed_loop:
+            if ticks.stim and self.stimulating:
                 self._pulse(now, applied, offset=0)
 
             target = np.full(len(joints), np.nan) if intent.target is None else intent.target

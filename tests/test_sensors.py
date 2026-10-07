@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from heroes_sim.config import load_config
+from heroes_sim.config import AmplifierConfig, load_config
 from heroes_sim.sensors.emg import EMGSensor
 from heroes_sim.sensors.kinematics import AngleSensor
 from heroes_sim.stim import PulseEvent
@@ -20,7 +20,14 @@ def only(cfg, *enabled, saturation=None):
     for name in ("volitional", "white_noise", *CONTAMINATION):
         sub = getattr(cfg.emg, name)
         update[name] = sub.model_copy(update={"enabled": name in enabled})
-    update["saturation_mv"] = saturation
+    update["amplifier"] = (
+        None
+        if saturation is None
+        # rail = supply / 2 / gain: pick the supply that gives the requested rail, ideal recovery
+        else AmplifierConfig(
+            supply_v=2 * saturation * 200.0 / 1000.0, raw_gain=200.0, overload_recovery_ms=0.0
+        )
+    )
     return cfg.emg.model_copy(update=update)
 
 
@@ -194,3 +201,34 @@ def test_angle_sensor_stamps_and_stale(cfg):
     for _ in range(40):
         s.push(np.array([2.0]))
     assert s.sample(0.6)[0] == last[0] and s.stamp == pytest.approx(0.51 - 0.01)
+
+
+def test_rail_from_supply_and_gain(cfg):
+    """H1: output 0..Vs centred at Vs/2 -> input-referred rail Vs / 2 / gain."""
+    amp = cfg.emg.amplifier
+    assert cfg.emg.saturation_mv == pytest.approx(1000 * amp.supply_v / 2 / amp.raw_gain)
+    five = cfg.emg.model_copy(update={"amplifier": amp.model_copy(update={"supply_v": 5.0})})
+    assert five.saturation_mv == pytest.approx(12.5)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_overload_recovery(cfg, sign):
+    """H2: after saturating, the output returns to the signal with time constant tau."""
+    rec = cfg.emg.model_copy(
+        update={
+            "amplifier": cfg.emg.amplifier.model_copy(update={"overload_recovery_ms": 5.0}),
+            **{
+                k: getattr(cfg.emg, k).model_copy(update={"enabled": False})
+                for k in ("volitional", "white_noise", *CONTAMINATION)
+            },
+        }
+    )
+    s = sensor(cfg, rec)
+    rail = rec.saturation_mv
+    x = np.zeros((200, 2))
+    x[:10, 0] = sign * 3 * rail  # driven past the rail, then back to 0
+    y = s._amplifier(x)
+    assert np.all(y[:10, 0] == sign * rail)  # clipped at either rail
+    tau = round(5e-3 * 2000)
+    assert y[10 + tau - 1, 0] == pytest.approx(sign * rail * np.exp(-1), rel=0.02)
+    assert abs(y[-1, 0]) < 1e-3 * rail and np.all(y[:, 1] == 0)

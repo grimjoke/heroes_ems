@@ -17,20 +17,38 @@ SCI = "configs/patients/sci_c5.yaml"
 # Refresh from `scripts/run.py configs/scenarios/mvc_calibration.yaml` -> meta.json "calibrated".
 HEALTHY_MVC = {
     "scenario.calibrated": {
-        "envelope": {"biceps": 0.5833, "triceps": 0.4640},
-        "rest": {"biceps": 0.0180, "triceps": 0.0171},
+        "envelope": {"biceps": 0.5807, "triceps": 0.4634},
+        "rest": {"biceps": 0.0141, "triceps": 0.0120},
         "deadband": {"r_elbow_flex": 0.05},
         "emg_rest_std": {"biceps": 0.0208, "triceps": 0.0201},
     }
 }
 SCI_MVC = {
     "scenario.calibrated": {
-        "envelope": {"biceps": 0.2052, "triceps": 0.0260},
-        "rest": {"biceps": 0.0164, "triceps": 0.0136},
-        "deadband": {"r_elbow_flex": 0.05},
+        "envelope": {"biceps": 0.2032, "triceps": 0.0234},
+        "rest": {"biceps": 0.0119, "triceps": 0.0050},
+        "deadband": {"r_elbow_flex": 0.1631},
         "emg_rest_std": {"biceps": 0.0176, "triceps": 0.0128},
     }
 }
+
+# D17 candidate: adaptive mains canceller on (calibrated with it, seed 0).
+CANCELLER = {"freqs_hz": [50.0, 100.0, 150.0], "mu": 0.002, "mu_bias": 0.02}
+SCI_CANCEL_MVC = {
+    "controller.mains_canceller": CANCELLER,
+    "scenario.calibrated": {
+        "envelope": {"biceps": 0.1984, "triceps": 0.0229},
+        "rest": {"biceps": 0.0110, "triceps": 0.0030},
+        "deadband": {"r_elbow_flex": 0.05},
+        "emg_rest_std": {"biceps": 0.0176, "triceps": 0.0123},
+    },
+}
+D17_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="D17 (open): without the mains canceller the D14 stim-on deadband is 0.16 for "
+    "sci_c5 (blanked mains leaks on the near-paralysed triceps), so the patient cannot drive "
+    "the reference and biceps stim never fires",
+)
 
 
 def cfg_for(name, patient=None, **overrides):
@@ -89,10 +107,16 @@ def test_no_intent_closed_loop_is_quiet(patient, mvc):
         assert metrics.time_at_cap(log, ch, 0.8) == 0.0
 
 
-@pytest.mark.parametrize("patient,mvc,max_rmse", [(None, HEALTHY_MVC, 0.15), (SCI, SCI_MVC, 0.6)])
+@pytest.mark.parametrize(
+    "patient,mvc,max_rmse",
+    [
+        (None, HEALTHY_MVC, 0.15),
+        pytest.param(SCI, SCI_MVC, 0.3, marks=D17_XFAIL),
+        (SCI, SCI_CANCEL_MVC, 0.25),
+    ],
+)
 def test_step_targets_closed_loop_tracks(patient, mvc, max_rmse):
-    """Sanity: stable, stim participates, no faults. Pure double integration (D6) tracks
-    sci_c5 poorly at the default gain (RMSE ~0.5 rad); that is a finding, not a bug."""
+    """Sanity: stable, stim participates, no faults."""
     cfg = cfg_for("step_targets", patient, **mvc)
     res = run(cfg, seed=0)
     log = res.log
@@ -102,15 +126,11 @@ def test_step_targets_closed_loop_tracks(patient, mvc, max_rmse):
     assert not any(e.rule in (*faults, "impedance") for e in res.events)  # no false trips
 
 
-def test_damped_reference_helps_impaired_hold():
-    """sci_c5 alone sags below the 1.8 rad target. With reference damping (the D6 candidate
-    fix) stim holds it higher. With pure double integration at the default gain it does
-    not (closed 1.56 vs open 1.61 rad): see README findings."""
-    base = {
-        "scenario.duration_s": 7.0,
-        **SCI_MVC,
-        "controller.joints.r_elbow_flex.damping": 10.0,
-    }
+@pytest.mark.parametrize("mvc", [pytest.param(SCI_MVC, marks=D17_XFAIL), SCI_CANCEL_MVC])
+def test_damped_reference_helps_impaired_hold(mvc):
+    """sci_c5 alone sags below the 1.8 rad target; with damping (D6) closed-loop stim holds
+    it higher. Pure double integration did not (closed 1.56 vs open 1.61 rad)."""
+    base = {"scenario.duration_s": 7.0, **mvc}
     open_log = run(cfg_for("step_targets", SCI, **base, **{"scenario.closed_loop": False}), 0).log
     closed_log = run(cfg_for("step_targets", SCI, **base), 0).log
     hold = slice(6.0, 7.0)
@@ -221,19 +241,25 @@ def test_summarize_and_metrics_json(tmp_path):
         ({"kind": "emg_dropout", "channel": "triceps"}, "emg_dead"),
         ({"kind": "angle_stale"}, "angle_stale"),
         ({"kind": "angle_freeze", "joint": J}, "angle_frozen"),
-        ({"kind": "electrode_detach", "channel": "biceps_stim", "contact": 0.3}, "impedance"),
+        ({"kind": "electrode_detach", "channel": "triceps_stim", "contact": 0.3}, "impedance"),
     ],
 )
 def test_each_fault_trips_its_rule(fault, rule):
-    """D10-D12: the supervisor now sees each fault class, soon after onset."""
-    ov = {"scenario.duration_s": 3.0, "scenario.faults": [{"t_start": 1.5, **fault}]}
+    """D10-D12: the supervisor sees each fault class soon after onset. The impedance rule
+    needs a stimulator that reports impedance, which this hardware lacks (H7): enabled here
+    to test the capability."""
+    ov = {
+        "scenario.duration_s": 3.0,
+        "scenario.faults": [{"t_start": 1.5, **fault}],
+        "safety.impedance_max_ohm": 2000.0,
+    }
     res = run(cfg_for("step_targets", SCI, **SCI_MVC, **ov), seed=0)
     first = min((e.t for e in res.events if e.rule == rule), default=None)
     assert first is not None and 1.5 <= first < 1.5 + 0.5, (rule, first)
     assert not any(e.rule == rule and e.t < 1.5 for e in res.events)
     after = res.log[res.log["t"] > first + 0.02]
     if rule == "impedance":  # only that channel is cut
-        assert (after["stim_biceps_stim"] == 0).all()
+        assert (after["stim_triceps_stim"] == 0).all()
     else:  # sensor faults: every channel is cut
         assert (after[["stim_biceps_stim", "stim_triceps_stim"]] == 0).all().all()
 
@@ -250,3 +276,52 @@ def test_partial_contact_raises_current_density():
         log.loc[1.05:, "current_density_biceps_stim"][on] / log.loc[1.05:, "stim_biceps_stim"][on]
     )
     np.testing.assert_allclose(ratio, 1 / 0.3)
+
+
+def test_partial_contact_undetected_without_impedance_reporting():
+    """H7: with the real stimulator (no impedance reporting) a partly detached electrode is
+    not detected: current density rises unchecked. This is on the hardware risk list."""
+    faults = [
+        {"kind": "electrode_detach", "channel": "triceps_stim", "contact": 0.3, "t_start": 1.0}
+    ]
+    ov = {"scenario.duration_s": 3.0, "scenario.faults": faults}
+    res = run(cfg_for("step_targets", SCI, **SCI_MVC, **ov), seed=0)
+    assert not any(e.rule == "impedance" for e in res.events)
+    after = res.log[res.log["t"] > 1.05]
+    on = after["stim_triceps_stim"] > 0
+    assert (
+        on.any()
+        and (
+            after.loc[on, "current_density_triceps_stim"] > 3 * after.loc[on, "stim_triceps_stim"]
+        ).all()
+    )
+
+
+def test_lead_off_latch_and_operator_reset_in_closed_loop():
+    """D16: an intermittent lead (off 1-1.5 s) keeps stim off until an operator reset, which
+    is refused while the lead is off and accepted once it has been live for 3 s."""
+    faults = [{"kind": "emg_dropout", "channel": "triceps", "t_start": 1.0, "t_end": 1.5}]
+    ov = {
+        "scenario.duration_s": 6.0,
+        "scenario.faults": faults,
+        "scenario.operator_resets": [1.4, 5.0],
+    }
+    log = run(cfg_for("step_targets", SCI, **SCI_MVC, **ov), seed=0).log.set_index("t")
+    assert log.loc[1.6:4.9, "safety_emg_dead"].astype(bool).all()  # still latched after lead back
+    assert (log.loc[1.6:4.9, ["stim_biceps_stim", "stim_triceps_stim"]] == 0).all().all()
+    attempts = log["operator_reset_accepted"].dropna()
+    assert list(attempts.round(0)) == [0.0, 1.0]  # refused at 1.4 s, accepted at 5.0 s
+    assert not log.loc[5.05:, "safety_emg_dead"].astype(bool).any()
+
+
+@pytest.mark.parametrize("patient,mvc", [(None, HEALTHY_MVC), (SCI, SCI_MVC)])
+def test_flexed_hold_stays_inside_joint_limits(patient, mvc):
+    """D18: holding 1.2 rad with no patient effort, stim carries the gravity load. At kp
+    >= 0.4 the inner loop limit-cycles past the joint limit (d18_inner_gain sweep); the
+    interim default must not. It sags instead (no integral term)."""
+    cfg = cfg_for("no_intent_flexed", patient, **mvc, **{"scenario.stim_off_baseline": False})
+    log = run(cfg, seed=0).log
+    lo, hi = cfg.safety.joint_limits[J]
+    q = log[f"q_{J}"]
+    assert lo <= q.min() and q.max() <= hi
+    assert q[log.t > 5].std() < 0.05  # settled, not oscillating

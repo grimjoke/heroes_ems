@@ -2,7 +2,7 @@
 
     uv run python scripts/run.py configs/scenarios/step_targets.yaml --seed 0
     uv run python scripts/run.py configs/scenarios/step_targets.yaml \\
-        --patient configs/patients/sci_c5.yaml --override controller.deadband_k=4
+        --patient configs/patients/sci_c5.yaml --override controller.deadband_percentile=99.5
     uv run python scripts/run.py --run-file sweeps/<name>/0003.yaml   # one sweep point
 """
 

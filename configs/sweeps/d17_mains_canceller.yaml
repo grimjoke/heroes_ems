@@ -1,0 +1,10 @@
+# D17: adaptive mains canceller before blanking, off (D15 as decided) vs on, at kp 0.6.
+# 20 seeds; also the no-fault false-trip check for the new front end.
+name: d17_mains_canceller
+grid:
+  scenario: [configs/scenarios/step_targets.yaml, configs/scenarios/no_intent.yaml]
+  patient: [configs/patients/healthy.yaml, configs/patients/sci_c5.yaml]
+  controller.mains_canceller:
+    - null
+    - {freqs_hz: [50.0, 100.0, 150.0], mu: 0.002, mu_bias: 0.02}
+seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]

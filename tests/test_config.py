@@ -86,8 +86,8 @@ def test_faults_validated(fault, match):
 
 def test_saturation_fault_needs_a_rail():
     fault = {"kind": "emg_saturation", "channel": "biceps", "t_start": 1.0}
-    with pytest.raises(ValidationError, match="saturation_mv"):
-        load_run_config(SC, overrides={"scenario.faults": [fault], "emg.saturation_mv": None})
+    with pytest.raises(ValidationError, match="amplifier"):
+        load_run_config(SC, overrides={"scenario.faults": [fault], "emg.amplifier": None})
 
 
 def test_fatigue_hold_scenario_loads():

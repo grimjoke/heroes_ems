@@ -8,8 +8,11 @@ trusted); the rest act per channel.
   emg_rail       an EMG channel has >= `emg_rail_min_samples` samples in the chunk at
                  either amplifier rail (|x| >= rail_fraction * rail): stuck/saturated lead
   emg_dead       an EMG channel's chunk std stays below `emg_dead_ratio` x its calibrated
-                 resting std for `emg_dead_ticks` ticks: detached recording electrode
-                 (cleared only after as many consecutive live ticks). With
+                 resting std for `emg_dead_ticks` ticks: detached recording electrode.
+                 Latched (D16): stays tripped until `request_lead_off_reset()`, which is
+                 accepted only once every tripped channel has been healthy (no dead run) for
+                 `emg_dead_reset_ticks`. With emg_dead_latch=False it clears by itself
+                 after `emg_dead_ticks` live ticks (for sim runs that must run through). With
                  agonist/antagonist differencing, a dead antagonist turns agonist noise into
                  intent, so this matters as much as saturation
   angle_stale    angle message older than `angle_max_age_s` (driver stuck; primary check)
@@ -66,6 +69,8 @@ class SafetyConfig:
     emg_rail_min_samples: int = 0  # per chunk; 0 = off
     emg_dead_ratio: float = 0.0  # 0 = off; needs emg_rest_std at construction
     emg_dead_ticks: int = 1
+    emg_dead_latch: bool = True  # D16: a lead-off needs an operator reset
+    emg_dead_reset_ticks: int = 1  # live ticks required before a reset is accepted
     angle_max_age_s: float | None = None
     angle_repeat_ticks: int = 0  # 0 = off
     impedance_max_ohm: float | None = None
@@ -99,6 +104,8 @@ class SafetyConfig:
             raise ValueError("emg_rail_fraction must be in (0, 1]")
         if not 0 <= self.emg_dead_ratio < 1 or self.emg_dead_ticks < 1:
             raise ValueError("emg_dead_ratio in [0, 1), emg_dead_ticks >= 1")
+        if self.emg_dead_reset_ticks < 1:
+            raise ValueError("emg_dead_reset_ticks >= 1")
         if self.angle_repeat_ticks < 0 or self.emg_rail_min_samples < 0:
             raise ValueError("counts must be >= 0")
 
@@ -233,11 +240,29 @@ class SafetySupervisor:
             self._dead_run = np.zeros(len(quiet), dtype=int)
             self._live_run = np.zeros(len(quiet), dtype=int)
             self._is_dead = np.zeros(len(quiet), dtype=bool)
+            self._healthy_run = np.zeros(len(quiet), dtype=int)
         self._dead_run = np.where(quiet, self._dead_run + 1, 0)
         self._live_run = np.where(quiet, 0, self._live_run + 1)
+        # Healthy = not inside a dead run. A live channel still has the odd quiet tick, so
+        # the reset gate counts healthy ticks, not strictly non-quiet ones.
+        healthy = self._dead_run < cfg.emg_dead_ticks
+        self._healthy_run = np.where(healthy, self._healthy_run + 1, 0)
         self._is_dead |= self._dead_run >= cfg.emg_dead_ticks
-        self._is_dead &= ~(self._live_run >= cfg.emg_dead_ticks)
+        if not cfg.emg_dead_latch:
+            self._is_dead &= ~(self._live_run >= cfg.emg_dead_ticks)
         return bool(np.any(self._is_dead))
+
+    def request_lead_off_reset(self) -> bool:
+        """Operator reset after a latched lead-off (D16). Accepted only if every tripped
+        channel has been healthy (not in a dead run) for `emg_dead_reset_ticks`
+        consecutive ticks (no dead run in that time); otherwise refused and the latch stays."""
+        if self._dead_run is None or not np.any(self._is_dead):
+            return True
+        live_long = self._healthy_run >= self.cfg.emg_dead_reset_ticks
+        if np.all(live_long[self._is_dead]):
+            self._is_dead[:] = False
+            return True
+        return False
 
     def _frozen(self, q: np.ndarray) -> bool:
         cfg = self.cfg
