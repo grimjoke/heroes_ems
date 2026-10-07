@@ -405,6 +405,8 @@ Resolved after M5 (PR #5):
 
 ### Open decisions
 
+Tracked as GitHub issues: D17 #6, D18 #7, D19 #8, D20 #9, D13 #10. Hardware risks and facts: #11–#16. Roadmap: #17–#20.
+
 | # | Decision | Evidence | Proposal |
 |---|---|---|---|
 | **D17** | Mains under the blank | Finding 13: the interp residual sets the sci_c5 deadband to 0.16, and the patient loses control of the reference (tracking worse than open loop; two tests are marked `xfail` for it). | **Turn on the adaptive mains canceller** (`controller.mains_canceller: {freqs_hz: [50, 100, 150], mu: 0.002, mu_bias: 0.02}`). It keeps D15 (interp + notch after) and adds a stage before blanking that cannot ring. Implemented and tested, off by default pending sign-off. Alternatives: per-channel deadbands; measure the real mains pickup first. |
