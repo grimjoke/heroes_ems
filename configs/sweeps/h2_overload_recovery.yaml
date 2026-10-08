@@ -1,0 +1,18 @@
+# H2 (#13): EMG amp saturates on every pulse (artifact 40 mV vs the 8.25 mV rail). How long
+# may overload recovery be before the 15 ms blank stops working, and does a longer blank
+# still give a usable, stable loop? Mains canceller on so mains does not confound the leak.
+name: h2_overload_recovery
+overrides:
+  emg.stim_artifact.amplitude_mv:
+    biceps: {biceps_stim: 40.0, triceps_stim: 5.0}
+    triceps: {biceps_stim: 5.0, triceps_stim: 40.0}
+  controller.mains_canceller: {freqs_hz: [50.0, 100.0, 150.0], mu: 0.002, mu_bias: 0.02}
+grid:
+  scenario:
+    - configs/scenarios/step_targets.yaml
+    - configs/scenarios/no_intent.yaml
+    - configs/scenarios/no_intent_flexed.yaml
+  patient: [configs/patients/healthy.yaml, configs/patients/sci_c5.yaml]
+  emg.amplifier.overload_recovery_ms: [0.0, 2.0, 5.0, 10.0]
+  controller.blanking_ms: [15.0, 20.0, 25.0, 30.0]
+seeds: [0, 1, 2, 3, 4]

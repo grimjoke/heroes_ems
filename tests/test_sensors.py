@@ -232,3 +232,13 @@ def test_overload_recovery(cfg, sign):
     tau = round(5e-3 * 2000)
     assert y[10 + tau - 1, 0] == pytest.approx(sign * rail * np.exp(-1), rel=0.02)
     assert abs(y[-1, 0]) < 1e-3 * rail and np.all(y[:, 1] == 0)
+    # Only the gap is filtered: after a clip on top of ongoing noise, output - input is a
+    # pure exponential (not lowpass-filtered noise), and then exactly 0.
+    s.reset()
+    noise = 1e-3 * np.random.default_rng(0).standard_normal((600, 2))
+    noise[:5, 0] += sign * 3 * rail
+    gap = (s._amplifier(noise) - noise)[5:, 0]
+    a = np.exp(-1 / tau)
+    live = np.abs(gap[1:]) > 0
+    np.testing.assert_allclose(gap[1:][live], a * gap[:-1][live], rtol=1e-9)
+    assert np.all(gap[400:] == 0)
