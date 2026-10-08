@@ -369,6 +369,22 @@ Two mechanisms, isolated on seeds 1 and 11. Artifact and M-wave were ruled out: 
 - With the canceller: deadband 0.05 on every seed; stim-on p99 intent 0.026–0.033 (was 0.17–0.20); sci_c5 tracking 0.189 rad at kp 0.3, at open-loop level; no_intent reference drift 0.016 rad (was 0.051). The healthy patient is unchanged. 0 false trips over 180 canceller runs.
 - It still needs the stim sync (H10), and the real mains pickup may be much smaller than the 20 µV modelled (measure it with H4).
 
+**14. EMG amp overload recovery: up to ~2 ms the 15 ms blank is enough; slower recovery costs control, not safety (H2, #13).**
+The hardware amp saturates on every pulse (H2). The default model's 8 mV artifact sits under the 8.25 mV rail and **never clipped**, so recovery was never exercised. `configs/sweeps/h2_overload_recovery.yaml` uses a 40 mV artifact (clips every pulse, about 2 rail samples per pulse), with the D17 canceller on, 5 seeds, 480 runs.
+
+| sci_c5: deadband / step_targets tracking RMSE | 15 ms blank | 20 ms | 25 ms | 30 ms |
+|---|---|---|---|---|
+| recovery 0 (instant) | 0.05 / 0.190 | 0.05 / 0.197 | 0.05 / 0.199 | 0.05 / 0.203 |
+| 2 ms | 0.06 / 0.191 | 0.05 / 0.197 | 0.05 / 0.199 | 0.05 / 0.203 |
+| 5 ms | **0.75 / 0.261** | **0.22 / 0.243** | 0.07 / 0.200 | 0.05 / 0.203 |
+| 10 ms | **0.99 / 0.375** | **0.99 / 0.372** | **0.76 / 0.252** | 0.05 / 0.210 |
+
+- **Rule of thumb:** the gap left after the clip decays as e^−t/τ from the 8.25 mV rail, so the blank must last about 3 ms + 7.4 τ to bring it under the 5 µV noise floor. That gives τ ≲ 1.6 ms for 15 ms and τ ≲ 3.6 ms for 30 ms. A calibration-only probe (3 seeds, τ from 0 to 10 ms) agrees: 15 ms holds to τ = 2 ms, 20 ms to 3 ms, 25 ms to about 5 ms, 30 ms to 10 ms.
+- **The failure is loss of control, not runaway.** The D14 stim-on calibration measures the leak and raises the deadband, so the reference stays put: `no_intent` drift ≤ 0.013 rad and controller excursion 0.07 rad in every cell. There were no joint-limit breaches (including `no_intent_flexed`) and 0 false trips in 480 runs. The healthy patient is unaffected (deadband 0.05 everywhere). The patient simply loses the ability to drive the reference.
+- **A longer blank is cheap here:** 30 ms costs 0.013 rad of sci_c5 tracking and 15 ms of extra delay, and the loop at kp 0.3 stays stable. At 30 Hz, 30 ms is the ceiling (one pulse period is 33 ms). Beyond τ ≈ 10 ms the options are a lower pulse rate, an amp with input protection and fast recovery, or subtracting the modelled recovery tail.
+- **Not covered:** the leak growing *after* calibration (gel drying, higher intensity) is not absorbed by the deadband. Re-check with `artifact_increase` once τ is measured.
+- **Model fix:** the recovery model was wrong. After a clip it lowpass-filtered the EMG until two samples happened to match within 8 nV, instead of decaying only the gap. Fixed and tested. No earlier result was affected, since nothing clipped before.
+
 ## Design decisions
 
 Resolved in [PR #3](https://github.com/grimjoke/heroes_ems/pull/3).
@@ -421,7 +437,7 @@ Answers to the H1–H11 list, as supplied. Each sets a config value or a risk.
 | # | Fact | Answer | In the sim |
 |---|---|---|---|
 | H1 | EMG amp rail | rail = supply / 2 / gain; RAW gain ~200 → ±12.5 mV at 5 V, ±8.25 mV at 3.3 V | `emg.amplifier` {`supply_v` 3.3, `raw_gain` 200} → `saturation_mv` derived; both rails tested. **Confirm the supply voltage.** |
-| H2 | Overload recovery | Not specified; **every stim pulse saturates this amp**. To measure (notes, step 2). | Modelled: `overload_recovery_ms` 5, exponential return after leaving the rail. |
+| H2 | Overload recovery | Not specified; **every stim pulse saturates this amp**. To measure (notes, step 2). | Modelled: exponential return of the gap after leaving the rail (`overload_recovery_ms`, placeholder 5). Default artifact (8 mV) does not clip yet. Finding 14: τ ≤ 2 ms works with the 15 ms blank, ≤ 5 ms needs 25 ms, ≤ 10 ms needs 30 ms. |
 | H3 | Hardware blanking | None | Software blanking stage (D2, D15) |
 | H4 | Noise floor | Not specified; measure 60 s at rest | `emg.white_noise.std_mv` stays 5 µV |
 | H5 | IMU | Unknown; model or a 60 s still recording to come | `angle_sensor.*` unchanged |
@@ -435,7 +451,7 @@ Answers to the H1–H11 list, as supplied. Each sets a config value or a risk.
 **Hardware risk list:**
 - **No impedance or lead-off reporting (H7).** A partly lifted pad keeps the same current over less area: at half contact the H9 example is 3 mA/cm², above the 2 mA/cm² attention level. Nothing in software can see it (tested: `test_partial_contact_undetected_without_impedance_reporting`). Needs a hardware or procedural mitigation.
 - **The controller cannot time the pulses (H10).** The sim's blanking (and the D17 canceller's freeze) assume a stimulator sync signal, as the spec does. With the device running its own programme, blanking needs either a sync output tapped from the stimulator or artifact detection on the EMG (threshold on the rail, H2). Until then, D15 results are an upper bound on what the hardware can do.
-- **Every pulse saturates the EMG amp (H2).** The sim's 8 mV artifact sits just under the 8.25 mV rail; real artifacts are larger. Recovery time decides whether 15 ms of blanking is enough; measure it.
+- **Every pulse saturates the EMG amp (H2).** Recovery time decides the blank length (finding 14): measure τ. Up to 2 ms the 15 ms blank works; up to 10 ms, 30 ms at 30 Hz. Slower than that needs a lower pulse rate or a faster-recovering amp. Too short a blank loses patient control rather than causing runaway.
 - **The series resistor (H8)** may change the delivered current; measure what reaches the pads.
 - **Pure double integration (D6)** is what the hardware runs today; the sim now uses damping 10. Change the hardware deliberately.
 
