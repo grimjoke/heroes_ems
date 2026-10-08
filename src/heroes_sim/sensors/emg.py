@@ -126,7 +126,7 @@ class EMGSensor:
         self.channel_fault: dict[int, str] = {}  # fault: channel -> "dropout" | "saturation"
         self._sample = 0
         self._amp_prev_y = np.zeros(self.n_channels)  # overload recovery state (H2)
-        self._recovering = np.zeros(self.n_channels, dtype=bool)
+        self._amp_gap = np.zeros(self.n_channels)  # decaying gap after leaving the rail
         self._pending = np.zeros((self._pulse_len, self.n_channels))
         self._bw_zi = np.zeros((self._bw_sos.shape[0], 2, self.n_channels))
 
@@ -148,8 +148,10 @@ class EMGSensor:
             self._pending[offset : offset + len(k)] += k[:, None] * amp[None, :]
 
     def _amplifier(self, x: np.ndarray) -> np.ndarray:
-        """Clip at +-rail (either sign); after saturation, the output relaxes back to the
-        input with `overload_recovery_ms` (H2): the gap decays as exp(-t / tau)."""
+        """Clip at +-rail (either sign); after saturation, the output returns to the input
+        with `overload_recovery_ms` (H2): y = x + g, where the gap g starts as the distance
+        from the rail to the input and decays as exp(-t / tau). Only the gap is filtered,
+        so once it has decayed the output is the input again, sample for sample."""
         rail = self.cfg.saturation_mv
         if rail is None:
             return x
@@ -160,20 +162,21 @@ class EMGSensor:
         a = np.exp(-1.0 / (self.fs * tau))
         sat = np.abs(x) >= rail
         for j in range(x.shape[1]):
-            if not (self._recovering[j] or sat[:, j].any()):
+            if not (self._amp_gap[j] or sat[:, j].any()):
                 continue
-            py, rec = self._amp_prev_y[j], self._recovering[j]
+            g, prev_y = self._amp_gap[j], self._amp_prev_y[j]
             for i in range(len(x)):
-                xi = x[i, j]
                 if sat[i, j]:
-                    rec = True
-                elif rec:  # relax from where the output is toward the input
-                    gap = a * (py - xi)
-                    y[i, j] = np.clip(xi + gap, -rail, rail)
-                    if abs(gap) < 1e-6 * rail:
-                        rec = False
-                py = y[i, j]
-            self._recovering[j] = rec
+                    g = 0.0
+                else:
+                    if prev_y in (rail, -rail) and abs(x[i, j]) < rail and g == 0.0:
+                        g = prev_y - x[i, j]  # just left the rail
+                    g *= a
+                    if abs(g) < 1e-6 * rail:
+                        g = 0.0
+                    y[i, j] = np.clip(x[i, j] + g, -rail, rail)
+                prev_y = y[i, j]
+            self._amp_gap[j] = g
         self._amp_prev_y = y[-1].copy()
         return y
 
